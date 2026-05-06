@@ -7,6 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 pathfinder_color.workspace = true
 warp_terminal.workspace = true
 warpui.workspace = true

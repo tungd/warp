@@ -1,5 +1,5 @@
 use pathfinder_color::ColorU;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use warp_terminal::shell::{ShellLaunchData, ShellType};
 use warpui::fonts::FamilyId;
 use warpui::{
@@ -7,11 +7,16 @@ use warpui::{
         Border, ConstrainedBox, CrossAxisAlignment, Flex, MainAxisAlignment, ParentElement, Rect,
         Stack, Text,
     },
+    r#async::Timer,
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
 };
 
+use crate::pty::{sanitize_terminal_bytes, PtySession};
+
 const TAB_HEIGHT: f32 = 40.0;
 const PANE_GAP: f32 = 1.0;
+const MAX_TERMINAL_TEXT_BYTES: usize = 60_000;
+const PTY_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone)]
 pub enum PaneGroupLiteAction {
@@ -42,6 +47,8 @@ struct Pane {
     kind: PaneKind,
     title: String,
     launch: Option<ShellLaunchData>,
+    session: Option<PtySession>,
+    output: String,
 }
 
 #[derive(Debug, Clone)]
@@ -82,9 +89,11 @@ impl PaneGroupLite {
             kind: PaneKind::Terminal,
             title: "shell".to_string(),
             launch: login_shell_launch_data(),
+            session: login_shell_session(),
+            output: String::new(),
         };
 
-        Self {
+        let view = Self {
             tabs: vec![Tab {
                 id: 1,
                 title: "shell".to_string(),
@@ -94,7 +103,11 @@ impl PaneGroupLite {
             next_tab_id: 2,
             next_pane_id: 2,
             font_family,
-        }
+        };
+
+        Self::schedule_pty_poll(ctx);
+
+        view
     }
 
     fn active_tab_mut(&mut self) -> Option<&mut Tab> {
@@ -114,7 +127,34 @@ impl PaneGroupLite {
             launch: (kind == PaneKind::Terminal)
                 .then(login_shell_launch_data)
                 .flatten(),
+            session: (kind == PaneKind::Terminal)
+                .then(login_shell_session)
+                .flatten(),
+            output: String::new(),
         }
+    }
+
+    fn schedule_pty_poll(ctx: &mut ViewContext<Self>) {
+        ctx.spawn(
+            async move {
+                Timer::after(PTY_POLL_INTERVAL).await;
+            },
+            |view, (), ctx| {
+                let did_drain = view.drain_pty_output();
+                if did_drain {
+                    ctx.notify();
+                }
+                Self::schedule_pty_poll(ctx);
+            },
+        );
+    }
+
+    fn drain_pty_output(&mut self) -> bool {
+        let mut did_drain = false;
+        for tab in &mut self.tabs {
+            did_drain |= drain_pane_node_output(&mut tab.root);
+        }
+        did_drain
     }
 
     fn split_active_leaf(&mut self, direction: SplitDirection, kind: PaneKind) {
@@ -234,11 +274,12 @@ impl PaneGroupLite {
     fn render_pane(&self, pane: &Pane) -> Box<dyn Element> {
         let title = format!("{} · {}", pane.title, pane.id);
         let body = match pane.kind {
-            PaneKind::Terminal => pane
+            PaneKind::Terminal if pane.output.is_empty() => pane
                 .launch
                 .as_ref()
-                .map(ShellLaunchData::shell_detail)
-                .unwrap_or_else(|| "login shell placeholder".to_string()),
+                .map(|launch| format!("starting {}", launch.shell_detail()))
+                .unwrap_or_else(|| "starting login shell".to_string()),
+            PaneKind::Terminal => pane.output.clone(),
             PaneKind::Agent => "local rich input placeholder".to_string(),
         };
 
@@ -261,7 +302,7 @@ impl PaneGroupLite {
                         .finish(),
                     )
                     .with_child(
-                        Text::new_inline(body, self.font_family, 13.0)
+                        Text::new(body, self.font_family, 13.0)
                             .with_color(ColorU::new(235, 235, 235, 255))
                             .finish(),
                     )
@@ -280,6 +321,42 @@ fn login_shell_launch_data() -> Option<ShellLaunchData> {
         executable_path,
         shell_type,
     })
+}
+
+fn login_shell_session() -> Option<PtySession> {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+
+    PtySession::spawn_login_shell(shell).ok()
+}
+
+fn drain_pane_node_output(node: &mut PaneNode) -> bool {
+    match node {
+        PaneNode::Leaf(pane) => drain_pane_output(pane),
+        PaneNode::Split { first, second, .. } => {
+            drain_pane_node_output(first) | drain_pane_node_output(second)
+        }
+    }
+}
+
+fn drain_pane_output(pane: &mut Pane) -> bool {
+    let Some(session) = &pane.session else {
+        return false;
+    };
+
+    let mut did_drain = false;
+    for bytes in session.drain_output() {
+        pane.output.push_str(&sanitize_terminal_bytes(&bytes));
+        did_drain = true;
+    }
+
+    if pane.output.len() > MAX_TERMINAL_TEXT_BYTES {
+        let keep_from = pane.output.len() - MAX_TERMINAL_TEXT_BYTES;
+        pane.output = pane.output[keep_from..].to_string();
+    }
+
+    did_drain
 }
 
 fn split_first_leaf(node: &mut PaneNode, direction: SplitDirection, new_pane: Pane) {
