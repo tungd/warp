@@ -7,7 +7,7 @@ use std::{
         ffi::OsStrExt,
         io::{FromRawFd, RawFd},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -34,6 +34,7 @@ struct PtySessionInner {
 
 impl PtySession {
     pub fn spawn_login_shell(shell: PathBuf) -> io::Result<Self> {
+        let cwd = initial_working_directory();
         let mut master_fd: RawFd = -1;
         let pid = unsafe {
             libc::forkpty(
@@ -49,7 +50,7 @@ impl PtySession {
         }
 
         if pid == 0 {
-            exec_login_shell(shell);
+            exec_login_shell(shell, cwd);
         }
 
         let master = unsafe { File::from_raw_fd(master_fd) };
@@ -110,7 +111,8 @@ fn read_pty_loop(mut reader: File, output_tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
-fn exec_login_shell(shell: PathBuf) -> ! {
+fn exec_login_shell(shell: PathBuf, cwd: PathBuf) -> ! {
+    let _ = chdir(&cwd);
     let _ = set_env("TERM", "xterm-256color");
     let _ = set_env("COLORTERM", "truecolor");
 
@@ -130,6 +132,28 @@ fn exec_login_shell(shell: PathBuf) -> ! {
             ptr::null::<libc::c_char>(),
         );
         libc::_exit(127);
+    }
+}
+
+fn initial_working_directory() -> PathBuf {
+    std::env::current_dir()
+        .ok()
+        .filter(|cwd| cwd != Path::new("/"))
+        .or_else(home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn chdir(path: &Path) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let rc = unsafe { libc::chdir(path.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
