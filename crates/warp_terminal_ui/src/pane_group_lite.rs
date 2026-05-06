@@ -25,6 +25,7 @@ pub enum PaneGroupLiteAction {
     CloseActiveTab,
     NextTab,
     PreviousTab,
+    SelectTab(usize),
     SplitRight,
     SplitDown,
     NewAgentPane,
@@ -191,56 +192,79 @@ impl PaneGroupLite {
                 ColorU::new(150, 150, 150, 255)
             };
 
-            row.add_child(
-                ConstrainedBox::new(
-                    Stack::new()
-                        .with_child(Rect::new().with_background_color(background).finish())
-                        .with_child(
-                            warpui::elements::Align::new(
-                                Text::new_inline(
-                                    format!("{} {}", tab.title, tab.id),
-                                    self.font_family,
-                                    13.0,
-                                )
-                                .with_color(text)
-                                .finish(),
-                            )
-                            .finish(),
-                        )
-                        .finish(),
-                )
-                .with_width(220.)
-                .with_height(TAB_HEIGHT)
-                .finish(),
-            );
-        }
-
-        row.add_child(
-            ConstrainedBox::new(
+            let tab_cell = ConstrainedBox::new(
                 Stack::new()
-                    .with_child(
-                        Rect::new()
-                            .with_background_color(ColorU::new(9, 9, 9, 255))
-                            .finish(),
-                    )
+                    .with_child(Rect::new().with_background_color(background).finish())
                     .with_child(
                         warpui::elements::Align::new(
-                            Text::new_inline("+", self.font_family, 22.0)
-                                .with_color(ColorU::new(180, 180, 180, 255))
-                                .finish(),
+                            Text::new_inline(
+                                format!("{} {}", tab.title, tab.id),
+                                self.font_family,
+                                13.0,
+                            )
+                            .with_color(text)
+                            .finish(),
                         )
                         .finish(),
                     )
                     .finish(),
             )
-            .with_width(60.)
+            .with_width(220.)
             .with_height(TAB_HEIGHT)
-            .finish(),
+            .finish();
+
+            row.add_child(
+                EventHandler::new(tab_cell)
+                    .on_left_mouse_down(move |event, _, _| {
+                        event.dispatch_typed_action(PaneGroupLiteAction::SelectTab(index));
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish(),
+            );
+        }
+
+        let new_tab_cell = ConstrainedBox::new(
+            Stack::new()
+                .with_child(
+                    Rect::new()
+                        .with_background_color(ColorU::new(9, 9, 9, 255))
+                        .finish(),
+                )
+                .with_child(
+                    warpui::elements::Align::new(
+                        Text::new_inline("+", self.font_family, 22.0)
+                            .with_color(ColorU::new(180, 180, 180, 255))
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_width(60.)
+        .with_height(TAB_HEIGHT)
+        .finish();
+
+        row.add_child(
+            EventHandler::new(new_tab_cell)
+                .on_left_mouse_down(|event, _, _| {
+                    event.dispatch_typed_action(PaneGroupLiteAction::NewTab);
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
         );
 
-        ConstrainedBox::new(row.finish())
-            .with_height(TAB_HEIGHT)
-            .finish()
+        ConstrainedBox::new(
+            Stack::new()
+                .with_child(
+                    Rect::new()
+                        .with_background_color(ColorU::new(9, 9, 9, 255))
+                        .finish(),
+                )
+                .with_child(row.finish())
+                .finish(),
+        )
+        .with_height(TAB_HEIGHT)
+        .finish()
     }
 
     fn render_pane_node(&self, node: &PaneNode) -> Box<dyn Element> {
@@ -519,6 +543,11 @@ impl TypedActionView for PaneGroupLite {
                     } else {
                         self.active_tab - 1
                     };
+                }
+            }
+            PaneGroupLiteAction::SelectTab(index) => {
+                if *index < self.tabs.len() {
+                    self.active_tab = *index;
                 }
             }
             PaneGroupLiteAction::SplitRight => {

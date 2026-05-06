@@ -28,7 +28,6 @@ impl fmt::Debug for PtySession {
 
 struct PtySessionInner {
     pid: libc::pid_t,
-    #[allow(dead_code)]
     writer: Mutex<File>,
     output_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
 }
@@ -69,7 +68,6 @@ impl PtySession {
         })
     }
 
-    #[allow(dead_code)]
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         self.inner
             .writer
