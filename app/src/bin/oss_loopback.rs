@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -564,6 +564,48 @@ struct LocalToolCall {
     id: String,
     name: String,
     arguments: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalToolResult {
+    tool_call_id: String,
+    name: String,
+    content: String,
+}
+
+fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
+    match tool_call.name.as_str() {
+        "read_file" => {
+            let path = tool_call
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .context("read_file requires a non-empty path")?;
+            let resolved = resolve_workspace_path(workspace, path)?;
+            let content = fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+            Ok(LocalToolResult {
+                tool_call_id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                content,
+            })
+        }
+        name => anyhow::bail!("unsupported local tool: {name}"),
+    }
+}
+
+fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
+    let requested = Path::new(requested);
+    if requested.is_absolute()
+        || requested
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("path must stay inside the workspace");
+    }
+    Ok(workspace.join(requested))
 }
 
 fn parse_openai_assistant_turn(value: &Value) -> Result<LocalAssistantTurn> {
@@ -1162,5 +1204,23 @@ mod tests {
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert_eq!(turn.tool_calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn executes_read_file_tool_relative_to_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("notes.md");
+        fs::write(&path, "local notes").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "notes.md" }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.tool_call_id, "call_read");
+        assert_eq!(result.name, "read_file");
+        assert_eq!(result.content, "local notes");
     }
 }
