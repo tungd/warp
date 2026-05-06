@@ -382,15 +382,7 @@ fn get_user_response(account: &LocalAccount) -> Value {
                 "apiKeyOwnerType": null,
                 "principalType": "USER",
                 "user": {
-                    "anonymousUserInfo": {
-                        "anonymousUserType": "NATIVE_CLIENT_ANONYMOUS_USER_FEATURE_GATED",
-                        "linkedAt": null,
-                        "personalObjectLimits": {
-                            "envVarLimit": 1_000_000,
-                            "notebookLimit": 1_000_000,
-                            "workflowLimit": 1_000_000,
-                        },
-                    },
+                    "anonymousUserInfo": null,
                     "experiments": [],
                     "isOnboarded": true,
                     "isOnWorkDomain": false,

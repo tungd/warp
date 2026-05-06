@@ -6,6 +6,7 @@ use std::sync::{
 use anyhow::anyhow;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
+use serde::Deserialize;
 use uuid::Uuid;
 use warp_core::channel::{Channel, ChannelState};
 use warp_graphql::object_permissions::OwnerType;
@@ -28,6 +29,7 @@ use super::{
 use super::user::UserMetadata;
 
 const ANONYMOUS_USER_NOTIFICATION_BLOCK_TIMER: Duration = Duration::days(7);
+const OSS_LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 
 /// Describes what persistence action to take based on the current auth state.
 pub(super) enum PersistAction {
@@ -137,6 +139,11 @@ impl AuthState {
             return state;
         }
 
+        if let Some(persisted) = Self::oss_loopback_user() {
+            state.apply_persisted_user(persisted);
+            return state;
+        }
+
         // Try reading from secure storage.
         match PersistedUser::from_secure_storage(ctx) {
             Ok(persisted) => {
@@ -157,6 +164,68 @@ impl AuthState {
         }
 
         state
+    }
+
+    fn oss_loopback_user() -> Option<PersistedUser> {
+        if ChannelState::channel() != Channel::Oss || !server_root_url_is_loopback() {
+            return None;
+        }
+
+        #[derive(Deserialize)]
+        struct LocalAccount {
+            user_id: String,
+            display_name: String,
+            id_token: String,
+            refresh_token: String,
+        }
+
+        let path = warp_core::paths::config_local_dir().join(OSS_LOCAL_ACCOUNT_FILE);
+        let account: LocalAccount = std::fs::read_to_string(&path)
+            .map_err(|err| {
+                log::warn!(
+                    "Unable to read OSS local account from {}: {err}",
+                    path.display()
+                );
+            })
+            .ok()
+            .and_then(|contents| {
+                serde_json::from_str(&contents)
+                    .map_err(|err| {
+                        log::warn!(
+                            "Unable to parse OSS local account from {}: {err}",
+                            path.display()
+                        );
+                    })
+                    .ok()
+            })?;
+
+        let auth_tokens = FirebaseAuthTokens::from_response(
+            account.id_token,
+            account.refresh_token,
+            "3600".to_string(),
+        )
+        .map_err(|err| {
+            log::warn!("Unable to create OSS local auth tokens: {err:#}");
+        })
+        .ok()?;
+
+        Some(PersistedUser {
+            auth_tokens,
+            #[allow(deprecated)]
+            refresh_token: String::new(),
+            local_id: UserUid::new(&account.user_id),
+            metadata: super::user::UserMetadata {
+                email: String::new(),
+                display_name: Some(account.display_name),
+                photo_url: None,
+            },
+            is_onboarded: true,
+            needs_sso_link: false,
+            anonymous_user_type: None,
+            linked_at: None,
+            personal_object_limits: None,
+            is_on_work_domain: false,
+        })
     }
 
     fn should_use_test_user() -> bool {
@@ -547,6 +616,14 @@ impl AuthState {
     pub fn api_key_owner_type(&self) -> Option<OwnerType> {
         self.credentials.read().as_ref()?.api_key_owner_type()
     }
+}
+
+fn server_root_url_is_loopback() -> bool {
+    let server_root_url = ChannelState::server_root_url();
+    let Ok(url) = url::Url::parse(server_root_url.as_ref()) else {
+        return false;
+    };
+    matches!(url.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
 }
 
 // Adapter for the [`warp_managed_secrets`] crate, which needs to access the current user.
