@@ -37,13 +37,13 @@ impl Channel {
     /// Whether this channel honors the `--server-root-url` / `--ws-server-url` /
     /// `--session-sharing-server-url` flags (and their `WARP_*` env-var equivalents).
     ///
-    /// Release channels (`Stable`, `Preview`, `Oss`) ignore these overrides so shipped
+    /// Release channels (`Stable`, `Preview`) ignore these overrides so shipped
     /// builds can't be redirected away from their baked-in server URLs. Internal-only channels
-    /// (`Dev`, `Local`, `Integration`) continue to honor them for local development and testing.
+    /// (`Dev`, `Local`, `Integration`) and OSS builds honor them for local development and testing.
     pub fn allows_server_url_overrides(&self) -> bool {
         match self {
-            Channel::Dev | Channel::Local | Channel::Integration => true,
-            Channel::Stable | Channel::Preview | Channel::Oss => false,
+            Channel::Dev | Channel::Local | Channel::Integration | Channel::Oss => true,
+            Channel::Stable | Channel::Preview => false,
         }
     }
 
@@ -57,6 +57,22 @@ impl Channel {
             Channel::Integration => "oz-integration",
             Channel::Oss => "warp-oss",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Channel;
+
+    #[test]
+    fn oss_allows_server_url_overrides() {
+        assert!(Channel::Oss.allows_server_url_overrides());
+    }
+
+    #[test]
+    fn stable_release_channels_do_not_allow_server_url_overrides() {
+        assert!(!Channel::Stable.allows_server_url_overrides());
+        assert!(!Channel::Preview.allows_server_url_overrides());
     }
 }
 
