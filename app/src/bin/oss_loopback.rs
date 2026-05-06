@@ -1,17 +1,28 @@
-use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use axum::{
+    body::Bytes,
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use base64::{prelude::BASE64_URL_SAFE, Engine as _};
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use warp_multi_agent_api as maa;
 
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
@@ -81,89 +92,157 @@ impl LocalAccount {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct LocalLlmConfig {
-    base_url: Option<String>,
-    token: Option<String>,
-    api_style: Option<String>,
-    model: Option<String>,
-    model_name: Option<String>,
-    name: Option<String>,
-    id: Option<String>,
-    display_name: Option<String>,
+    active_model: String,
+    #[serde(default)]
+    providers: Vec<LocalLlmProviderConfig>,
     #[serde(default)]
     models: Vec<LocalLlmConfigModel>,
 }
 
 impl LocalLlmConfig {
-    fn load() -> Self {
+    fn load() -> Result<Self> {
         let path = llm_config_path();
         if !path.exists() {
-            return Self::default();
+            anyhow::bail!("{} does not exist", path.display());
         }
 
-        match fs::read_to_string(&path)
+        fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))
             .and_then(|contents| {
                 toml::from_str(&contents)
                     .with_context(|| format!("failed to parse {}", path.display()))
-            }) {
-            Ok(config) => config,
-            Err(err) => {
-                log::warn!("Ignoring local LLM config: {err:#}");
-                Self::default()
-            }
-        }
+            })
     }
 
-    fn models(&self) -> Vec<ResolvedLocalLlm> {
-        let models = self
+    fn models(&self) -> Result<Vec<ResolvedLocalLlm>> {
+        self.models
+            .iter()
+            .map(|model| self.resolve_model(model))
+            .collect()
+    }
+
+    fn active_model(&self) -> Result<ResolvedLocalLlm> {
+        let active_model = required_str(&self.active_model, "active_model")?;
+        let model = self
             .models
             .iter()
-            .filter_map(|model| {
-                ResolvedLocalLlm::from_parts(
-                    model.id.as_deref(),
-                    model.display_name.as_deref(),
-                    model
-                        .model
-                        .as_deref()
-                        .or(model.model_name.as_deref())
-                        .or(model.name.as_deref()),
-                    model.base_url.as_deref().or(self.base_url.as_deref()),
-                    model.api_style.as_deref().or(self.api_style.as_deref()),
-                    model.token.as_deref().or(self.token.as_deref()),
+            .find(|model| model.matches(active_model))
+            .with_context(|| format!("active_model '{active_model}' was not found in models"))?;
+        self.resolve_model(model)
+    }
+
+    fn resolve_model(&self, model: &LocalLlmConfigModel) -> Result<ResolvedLocalLlm> {
+        let provider_name = required_str(&model.provider, "model.provider")?;
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.name.trim() == provider_name)
+            .with_context(|| {
+                format!(
+                    "provider '{provider_name}' for model '{}' was not found",
+                    model.alias_or_name()
                 )
-            })
-            .collect::<Vec<_>>();
+            })?;
 
-        if !models.is_empty() {
-            return models;
-        }
+        let model_name = required_str(&model.name, "model.name")?;
+        let alias = model.alias_or_name();
+        let api_base = required_str(&provider.api_base, "provider.api_base")?;
+        let api_style = provider
+            .api_style
+            .as_deref()
+            .map(str::trim)
+            .filter(|api_style| !api_style.is_empty())
+            .unwrap_or("openai");
+        let token = provider.resolve_api_key().with_context(|| {
+            format!(
+                "provider '{}' requires api_key, token, or api_key_env_var with a value",
+                provider.name
+            )
+        })?;
 
-        ResolvedLocalLlm::from_parts(
-            self.id.as_deref(),
-            self.display_name.as_deref(),
-            self.model
+        Ok(ResolvedLocalLlm {
+            id: model
+                .id
                 .as_deref()
-                .or(self.model_name.as_deref())
-                .or(self.name.as_deref()),
-            self.base_url.as_deref(),
-            self.api_style.as_deref(),
-            self.token.as_deref(),
-        )
-        .into_iter()
-        .collect()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(alias)
+                .to_owned(),
+            display_name: model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|display_name| !display_name.is_empty())
+                .unwrap_or(alias)
+                .to_owned(),
+            base_model_name: model_name.to_owned(),
+            base_url: api_base.to_owned(),
+            api_style: api_style.to_owned(),
+            token,
+            token_configured: true,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LocalLlmProviderConfig {
+    name: String,
+    api_base: String,
+    api_key_env_var: Option<String>,
+    api_key: Option<String>,
+    token: Option<String>,
+    api_style: Option<String>,
+}
+
+impl LocalLlmProviderConfig {
+    fn resolve_api_key(&self) -> Option<String> {
+        self.api_key
+            .as_deref()
+            .or(self.token.as_deref())
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.api_key_env_var
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|env_var| !env_var.is_empty())
+                    .and_then(|env_var| std::env::var(env_var).ok())
+                    .map(|token| token.trim().to_owned())
+                    .filter(|token| !token.is_empty())
+            })
     }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct LocalLlmConfigModel {
-    base_url: Option<String>,
-    token: Option<String>,
-    api_style: Option<String>,
-    model: Option<String>,
-    model_name: Option<String>,
-    name: Option<String>,
+    name: String,
+    provider: String,
+    alias: Option<String>,
     id: Option<String>,
     display_name: Option<String>,
+}
+
+impl LocalLlmConfigModel {
+    fn alias_or_name(&self) -> &str {
+        self.alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .or_else(|| Some(self.name.trim()).filter(|name| !name.is_empty()))
+            .unwrap_or("unknown")
+    }
+
+    fn matches(&self, active_model: &str) -> bool {
+        self.alias
+            .as_deref()
+            .is_some_and(|alias| alias.trim() == active_model)
+            || self.name.trim() == active_model
+            || self
+                .id
+                .as_deref()
+                .is_some_and(|id| id.trim() == active_model)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -173,51 +252,11 @@ struct ResolvedLocalLlm {
     base_model_name: String,
     base_url: String,
     api_style: String,
+    token: String,
     token_configured: bool,
 }
 
 impl ResolvedLocalLlm {
-    fn from_parts(
-        id: Option<&str>,
-        display_name: Option<&str>,
-        model: Option<&str>,
-        base_url: Option<&str>,
-        api_style: Option<&str>,
-        token: Option<&str>,
-    ) -> Option<Self> {
-        let model = model?.trim();
-        if model.is_empty() {
-            return None;
-        }
-
-        let api_style = api_style.unwrap_or("openai").trim();
-        let base_url = base_url.unwrap_or("").trim();
-        let id = id
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "local-{}-{}",
-                    sanitize_identifier(api_style),
-                    sanitize_identifier(model)
-                )
-            });
-
-        Some(Self {
-            id,
-            display_name: display_name
-                .map(str::trim)
-                .filter(|display_name| !display_name.is_empty())
-                .unwrap_or(model)
-                .to_owned(),
-            base_model_name: model.to_owned(),
-            base_url: base_url.to_owned(),
-            api_style: api_style.to_owned(),
-            token_configured: token.is_some_and(|token| !token.trim().is_empty()),
-        })
-    }
-
     fn provider(&self) -> &'static str {
         match self.api_style.trim().to_ascii_lowercase().as_str() {
             "anthropic" | "claude" => "ANTHROPIC",
@@ -248,6 +287,7 @@ impl ResolvedLocalLlm {
 #[derive(Clone)]
 struct ServerState {
     account: Arc<LocalAccount>,
+    client: reqwest::Client,
 }
 
 pub struct LoopbackServer {
@@ -258,7 +298,11 @@ pub struct LoopbackServer {
 impl LoopbackServer {
     pub fn spawn() -> Result<Self> {
         let account = Arc::new(LocalAccount::load_or_create()?);
-        let state = ServerState { account };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("failed to create OSS loopback HTTP client")?;
+        let state = ServerState { account, client };
 
         let std_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .context("failed to bind OSS loopback server")?;
@@ -279,6 +323,8 @@ impl LoopbackServer {
         let router = Router::new()
             .route("/healthz", get(healthz))
             .route("/graphql/v2", post(graphql_v2))
+            .route("/ai/multi-agent", post(multi_agent))
+            .route("/ai/passive-suggestions", post(passive_suggestions))
             .route("/proxy/customToken", post(proxy_token))
             .route("/proxy/token", post(proxy_token))
             .with_state(state);
@@ -356,6 +402,395 @@ async fn graphql_v2(
     };
 
     Json(response).into_response()
+}
+
+async fn multi_agent(State(state): State<ServerState>, body: Bytes) -> Response {
+    let request = match maa::Request::decode(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "errors": [{
+                        "message": format!("invalid multi-agent protobuf request: {err}")
+                    }]
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let output = match generate_local_agent_output(&state, &request).await {
+        Ok(output) => output,
+        Err(err) => local_agent_error_message(err),
+    };
+
+    response_event_stream(agent_response_events(&request, output))
+}
+
+async fn passive_suggestions(_: State<ServerState>, body: Bytes) -> Response {
+    let request =
+        match maa::Request::decode(body) {
+            Ok(request) => request,
+            Err(err) => return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "errors": [{
+                        "message": format!("invalid passive-suggestions protobuf request: {err}")
+                    }]
+                })),
+            )
+                .into_response(),
+        };
+
+    response_event_stream(finished_response_events(&request))
+}
+
+async fn generate_local_agent_output(
+    state: &ServerState,
+    request: &maa::Request,
+) -> Result<String> {
+    let prompt = extract_user_prompt(request)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
+
+    let model = LocalLlmConfig::load()?.active_model()?;
+
+    match model.api_style.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => call_anthropic_compatible(&state.client, &model, &prompt).await,
+        "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
+        | "gemini" | "openrouter" => call_openai_compatible(&state.client, &model, &prompt).await,
+        _ => call_openai_compatible(&state.client, &model, &prompt).await,
+    }
+}
+
+async fn call_openai_compatible(
+    client: &reqwest::Client,
+    model: &ResolvedLocalLlm,
+    prompt: &str,
+) -> Result<String> {
+    let url = completion_url(&model.base_url, "chat/completions");
+    let mut request = client.post(url).json(&json!({
+        "model": model.base_model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are running inside a local Warp OSS sidecar. Answer directly. Do not claim to have tool access."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "stream": false,
+    }));
+    request = request.bearer_auth(&model.token);
+
+    let response = request.send().await.context("failed to call local LLM")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read local LLM response")?;
+    if !status.is_success() {
+        anyhow::bail!("local LLM returned {status}: {body}");
+    }
+
+    let value: Value = serde_json::from_str(&body).context("failed to parse local LLM response")?;
+    extract_openai_text(&value).context("local LLM response did not contain message content")
+}
+
+async fn call_anthropic_compatible(
+    client: &reqwest::Client,
+    model: &ResolvedLocalLlm,
+    prompt: &str,
+) -> Result<String> {
+    let url = completion_url(&model.base_url, "v1/messages");
+    let mut request = client
+        .post(url)
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+        )
+        .json(&json!({
+            "model": model.base_model_name,
+            "max_tokens": 4096,
+            "messages": [{
+                "role": "user",
+                "content": prompt
+            }],
+        }));
+    request = request.header("x-api-key", &model.token);
+
+    let response = request.send().await.context("failed to call local LLM")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read local LLM response")?;
+    if !status.is_success() {
+        anyhow::bail!("local LLM returned {status}: {body}");
+    }
+
+    let value: Value = serde_json::from_str(&body).context("failed to parse local LLM response")?;
+    extract_anthropic_text(&value).context("local LLM response did not contain text content")
+}
+
+fn completion_url(base_url: &str, endpoint: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with(endpoint) {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/{endpoint}")
+    }
+}
+
+fn extract_openai_text(value: &Value) -> Option<String> {
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(text_value)
+        .or_else(|| value.pointer("/choices/0/text").and_then(text_value))
+}
+
+fn extract_anthropic_text(value: &Value) -> Option<String> {
+    value.get("content").and_then(text_value)
+}
+
+fn text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_owned()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn agent_response_events(request: &maa::Request, output: String) -> Vec<maa::ResponseEvent> {
+    let stream_ids = stream_ids(request);
+    let task_info = task_info(request);
+    let message = maa::Message {
+        id: format!("local-message-{}", Uuid::new_v4()),
+        task_id: task_info.id.clone(),
+        request_id: stream_ids.request_id.clone(),
+        timestamp: Some(now_timestamp()),
+        server_message_data: String::new(),
+        citations: Vec::new(),
+        message: Some(maa::message::Message::AgentOutput(
+            maa::message::AgentOutput { text: output },
+        )),
+    };
+
+    let mut actions = Vec::new();
+    if task_info.needs_create {
+        actions.push(maa::ClientAction {
+            action: Some(maa::client_action::Action::CreateTask(
+                maa::client_action::CreateTask {
+                    task: Some(maa::Task {
+                        id: task_info.id.clone(),
+                        description: task_info.description,
+                        dependencies: None,
+                        messages: Vec::new(),
+                        summary: String::new(),
+                        server_data: String::new(),
+                    }),
+                },
+            )),
+        });
+    }
+    actions.push(maa::ClientAction {
+        action: Some(maa::client_action::Action::AddMessagesToTask(
+            maa::client_action::AddMessagesToTask {
+                task_id: task_info.id,
+                messages: vec![message],
+            },
+        )),
+    });
+
+    vec![
+        init_event(&stream_ids),
+        maa::ResponseEvent {
+            r#type: Some(maa::response_event::Type::ClientActions(
+                maa::response_event::ClientActions { actions },
+            )),
+        },
+        finished_event(),
+    ]
+}
+
+fn finished_response_events(request: &maa::Request) -> Vec<maa::ResponseEvent> {
+    let stream_ids = stream_ids(request);
+    vec![init_event(&stream_ids), finished_event()]
+}
+
+fn init_event(stream_ids: &StreamIds) -> maa::ResponseEvent {
+    maa::ResponseEvent {
+        r#type: Some(maa::response_event::Type::Init(
+            maa::response_event::StreamInit {
+                conversation_id: stream_ids.conversation_id.clone(),
+                request_id: stream_ids.request_id.clone(),
+                run_id: stream_ids.run_id.clone(),
+            },
+        )),
+    }
+}
+
+fn finished_event() -> maa::ResponseEvent {
+    maa::ResponseEvent {
+        r#type: Some(maa::response_event::Type::Finished(
+            maa::response_event::StreamFinished {
+                token_usage: Vec::new(),
+                should_refresh_model_config: false,
+                request_cost: None,
+                conversation_usage_metadata: None,
+                reason: Some(maa::response_event::stream_finished::Reason::Done(
+                    maa::response_event::stream_finished::Done {},
+                )),
+            },
+        )),
+    }
+}
+
+fn response_event_stream(events: Vec<maa::ResponseEvent>) -> Response {
+    let mut body = String::new();
+    for event in events {
+        let encoded = BASE64_URL_SAFE.encode(event.encode_to_vec());
+        body.push_str("data: \"");
+        body.push_str(&encoded);
+        body.push_str("\"\n\n");
+    }
+
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Clone)]
+struct StreamIds {
+    conversation_id: String,
+    request_id: String,
+    run_id: String,
+}
+
+fn stream_ids(request: &maa::Request) -> StreamIds {
+    let conversation_id = request
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.conversation_id.trim())
+        .filter(|conversation_id| !conversation_id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("local-conversation-{}", Uuid::new_v4()));
+    StreamIds {
+        conversation_id,
+        request_id: format!("local-request-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4().to_string(),
+    }
+}
+
+struct TaskInfo {
+    id: String,
+    description: String,
+    needs_create: bool,
+}
+
+fn task_info(request: &maa::Request) -> TaskInfo {
+    if let Some(task) = request
+        .task_context
+        .as_ref()
+        .and_then(|context| context.tasks.first())
+    {
+        return TaskInfo {
+            id: task.id.clone(),
+            description: task.description.clone(),
+            needs_create: false,
+        };
+    }
+
+    TaskInfo {
+        id: format!("local-task-{}", Uuid::new_v4()),
+        description: extract_user_prompt(request)
+            .map(|prompt| prompt.lines().next().unwrap_or_default().to_string())
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| "Local sidecar task".to_string()),
+        needs_create: true,
+    }
+}
+
+#[allow(deprecated)]
+fn extract_user_prompt(request: &maa::Request) -> Option<String> {
+    use maa::request::input::user_inputs::user_input::Input as UserInput;
+    use maa::request::input::Type;
+
+    let input = request.input.as_ref()?;
+    match input.r#type.as_ref()? {
+        Type::UserInputs(inputs) => {
+            inputs
+                .inputs
+                .iter()
+                .find_map(|input| match input.input.as_ref()? {
+                    UserInput::UserQuery(query) => Some(query.query.clone()),
+                    UserInput::CliAgentUserQuery(query) => {
+                        query.user_query.as_ref().map(|query| query.query.clone())
+                    }
+                    _ => None,
+                })
+        }
+        Type::QueryWithCannedResponse(query) => Some(query.query.clone()),
+        Type::AutoCodeDiffQuery(query) => Some(query.query.clone()),
+        Type::CreateNewProject(query) => Some(query.query.clone()),
+        Type::CloneRepository(query) => Some(format!("Clone repository {}", query.url)),
+        Type::SummarizeConversation(query) => Some(query.prompt.clone()),
+        Type::CreateEnvironment(query) => Some(format!(
+            "Create a development environment for {}",
+            query.repo_paths.join(", ")
+        )),
+        Type::StartFromAmbientRunPrompt(query) => Some(query.runtime_base_prompt.clone()),
+        Type::InvokeSkill(query) => query
+            .user_query
+            .as_ref()
+            .map(|query| query.query.clone())
+            .or_else(|| Some("Invoke the selected skill.".to_string())),
+        Type::UserQuery(query) => Some(query.query.clone()),
+        _ => None,
+    }
+}
+
+fn now_timestamp() -> prost_types::Timestamp {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    prost_types::Timestamp {
+        seconds: now.as_secs() as i64,
+        nanos: now.subsec_nanos() as i32,
+    }
+}
+
+fn required_str<'a>(value: &'a str, field: &str) -> Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{field} is required");
+    }
+    Ok(value)
+}
+
+fn local_agent_error_message(err: anyhow::Error) -> String {
+    format!("Local sidecar LLM request failed:\n\n{err:#}")
 }
 
 fn create_anonymous_user_response(account: &LocalAccount) -> Value {
@@ -458,19 +893,21 @@ fn response_context() -> Value {
 }
 
 fn feature_model_choice() -> Value {
-    let config = LocalLlmConfig::load();
-    let models = config.models();
-    let local = if models.is_empty() {
-        available_llms(&[ResolvedLocalLlm {
-            id: "local".to_string(),
-            display_name: "Local Model".to_string(),
-            base_model_name: "local".to_string(),
-            base_url: String::new(),
-            api_style: "local".to_string(),
-            token_configured: false,
-        }])
-    } else {
-        available_llms(&models)
+    let local = match LocalLlmConfig::load() {
+        Ok(config) => match config.models() {
+            Ok(models) if !models.is_empty() => {
+                available_llms(&models, Some(config.active_model.as_str()))
+            }
+            Ok(_) => unavailable_llms("No models are configured in llm.toml"),
+            Err(err) => {
+                log::warn!("Ignoring local LLM config: {err:#}");
+                unavailable_llms("The local LLM config is invalid")
+            }
+        },
+        Err(err) => {
+            log::warn!("Local LLM config is unavailable: {err:#}");
+            unavailable_llms("Create ~/.warp-oss/llm.toml to enable local models")
+        }
     };
     json!({
         "agentMode": local.clone(),
@@ -481,15 +918,55 @@ fn feature_model_choice() -> Value {
     })
 }
 
-fn available_llms(models: &[ResolvedLocalLlm]) -> Value {
-    let default_id = models
-        .first()
-        .map(|model| model.id.as_str())
+fn available_llms(models: &[ResolvedLocalLlm], active_model: Option<&str>) -> Value {
+    let default_id = active_model
+        .and_then(|active_model| {
+            models
+                .iter()
+                .find(|model| model.id == active_model || model.base_model_name == active_model)
+                .map(|model| model.id.as_str())
+        })
+        .or_else(|| models.first().map(|model| model.id.as_str()))
         .unwrap_or("local");
     json!({
         "defaultId": default_id,
         "preferredCodexModelId": null,
         "choices": models.iter().map(llm_info).collect::<Vec<_>>(),
+    })
+}
+
+fn unavailable_llms(disable_reason: &str) -> Value {
+    json!({
+        "defaultId": "local-config-required",
+        "preferredCodexModelId": null,
+        "choices": [{
+            "displayName": "Local Config Required",
+            "baseModelName": "local-config-required",
+            "id": "local-config-required",
+            "reasoningLevel": null,
+            "usageMetadata": {
+                "creditMultiplier": null,
+                "requestMultiplier": 0,
+            },
+            "description": "Local sidecar model configuration",
+            "disableReason": disable_reason,
+            "visionSupported": false,
+            "spec": null,
+            "provider": "UNKNOWN",
+            "hostConfigs": [{
+                "enabled": false,
+                "modelRoutingHost": "DIRECT_API",
+            }],
+            "pricing": {
+                "discountPercentage": null,
+            },
+            "contextWindow": {
+                "isConfigurable": true,
+                "min": 1024,
+                "max": 200000,
+                "default": 32000,
+            },
+        }],
     })
 }
 
