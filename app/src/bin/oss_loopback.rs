@@ -1190,7 +1190,7 @@ where
     let mut messages = vec![
         json!({
             "role": "system",
-            "content": "You are running inside a local Warp OSS sidecar. Answer directly and use local tools when they are useful."
+            "content": local_agent_system_prompt()
         }),
         json!({
             "role": "user",
@@ -1218,6 +1218,16 @@ where
     }
 
     anyhow::bail!("local agent exceeded {LOCAL_AGENT_MAX_TURNS} tool turns")
+}
+
+fn local_agent_system_prompt() -> &'static str {
+    "You are a local coding agent running inside a Warp OSS loopback sidecar. \
+Use tools to inspect and modify the user's current workspace. \
+Available tools: read_file for reading workspace files, grep for searching, write_file for creating or overwriting files, and bash for non-interactive workspace commands. \
+Before editing an existing file, inspect it with read_file or grep. \
+Prefer read_file, grep, and write_file over bash for file operations. \
+After making code changes, run a relevant verification command with bash when one is reasonably available. \
+Keep final answers concise and report what changed plus any verification result."
 }
 
 fn openai_assistant_message(turn: &LocalAssistantTurn) -> Value {
@@ -1761,6 +1771,16 @@ mod tests {
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert_eq!(turn.tool_calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn local_agent_system_prompt_describes_available_tools() {
+        let prompt = local_agent_system_prompt();
+
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("grep"));
+        assert!(prompt.contains("bash"));
     }
 
     #[test]
