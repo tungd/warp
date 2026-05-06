@@ -733,27 +733,33 @@ fn fetch_auth_tokens(
         let url = token.access_token_url(&firebase_api_key);
         let request_body = token.access_token_request_body();
         let proxy_url = token.proxy_url(&ChannelState::server_root_url(), &firebase_api_key);
-        let response = match client
-            .post(&url)
-            .form(&request_body)
-            .timeout(FETCH_ACCESS_TOKEN_TIMEOUT)
-            .send()
-            .await
-        {
-            Ok(response) => match response.error_for_status_ref() {
-                Ok(_) => Ok(response),
+        let response = if should_prefer_auth_proxy() {
+            fetch_access_token_via_proxy(client, &request_body, proxy_url).await
+        } else {
+            match client
+                .post(&url)
+                .form(&request_body)
+                .timeout(FETCH_ACCESS_TOKEN_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) => match response.error_for_status_ref() {
+                    Ok(_) => Ok(response),
+                    Err(error) => {
+                        log::warn!(
+                            "Request to firebase to fetch access token completed, but was unsuccessful: {error:?}"
+                        );
+
+                        fetch_access_token_via_proxy(client, &request_body, proxy_url).await
+                    }
+                },
                 Err(error) => {
                     log::warn!(
-                        "Request to firebase to fetch access token completed, but was unsuccessful: {error:?}"
+                        "Failed to make response to firebase to fetch access token: {error:?}"
                     );
 
                     fetch_access_token_via_proxy(client, &request_body, proxy_url).await
                 }
-            },
-            Err(error) => {
-                log::warn!("Failed to make response to firebase to fetch access token: {error:?}");
-
-                fetch_access_token_via_proxy(client, &request_body, proxy_url).await
             }
         }?;
 
@@ -774,6 +780,14 @@ fn fetch_auth_tokens(
             FetchAccessTokenResponse::Error { error } => Err(error.into()),
         }
     })
+}
+
+fn should_prefer_auth_proxy() -> bool {
+    let server_root_url = ChannelState::server_root_url();
+    let Ok(url) = url::Url::parse(server_root_url.as_ref()) else {
+        return false;
+    };
+    matches!(url.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
 }
 
 fn fetch_access_token_via_proxy<'a>(
