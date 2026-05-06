@@ -763,7 +763,7 @@ impl TypedActionView for PaneGroupLite {
                 self.send_input_to_active_terminal(bytes);
             }
             PaneGroupLiteAction::QuitApp => {
-                ctx.terminate_app();
+                ctx.terminate_app_cancellable();
             }
         }
 

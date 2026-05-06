@@ -692,7 +692,7 @@ impl<'a, T: View> ViewContext<'a, T> {
             .close_window_async(self.window_id, TerminationMode::Cancellable);
     }
 
-    pub fn terminate_app(&mut self) {
+    pub fn terminate_app_cancellable(&mut self) {
         self.app.terminate_app(TerminationMode::Cancellable, None);
     }
 
