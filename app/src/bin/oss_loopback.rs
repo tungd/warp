@@ -553,6 +553,79 @@ fn extract_openai_text(value: &Value) -> Option<String> {
         .or_else(|| value.pointer("/choices/0/text").and_then(text_value))
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct LocalAssistantTurn {
+    content: String,
+    tool_calls: Vec<LocalToolCall>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn parse_openai_assistant_turn(value: &Value) -> Result<LocalAssistantTurn> {
+    let message = value
+        .pointer("/choices/0/message")
+        .or_else(|| value.pointer("/message"))
+        .context("local LLM response did not contain an assistant message")?;
+    let content = message
+        .get("content")
+        .and_then(text_value)
+        .unwrap_or_default();
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|tool_calls| {
+            tool_calls
+                .iter()
+                .enumerate()
+                .map(parse_openai_tool_call)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(LocalAssistantTurn {
+        content,
+        tool_calls,
+    })
+}
+
+fn parse_openai_tool_call((index, tool_call): (usize, &Value)) -> Result<LocalToolCall> {
+    let function = tool_call
+        .get("function")
+        .context("tool call did not contain function data")?;
+    let id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("local-tool-call-{index}"));
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .context("tool call function name is required")?
+        .to_owned();
+    let arguments = match function.get("arguments") {
+        Some(Value::String(arguments)) if !arguments.trim().is_empty() => {
+            serde_json::from_str(arguments)
+                .with_context(|| format!("tool call '{name}' arguments were not valid JSON"))?
+        }
+        Some(arguments) => arguments.clone(),
+        None => json!({}),
+    };
+
+    Ok(LocalToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
 fn extract_anthropic_text(value: &Value) -> Option<String> {
     value.get("content").and_then(text_value)
 }
@@ -1057,5 +1130,37 @@ fn sanitize_identifier(value: &str) -> String {
         "unknown".to_string()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_openai_tool_calls_from_chat_completion() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "content": "I'll inspect that file.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let turn = parse_openai_assistant_turn(&response).unwrap();
+
+        assert_eq!(turn.content, "I'll inspect that file.");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "call_1");
+        assert_eq!(turn.tool_calls[0].name, "read_file");
+        assert_eq!(turn.tool_calls[0].arguments["path"], "Cargo.toml");
     }
 }
