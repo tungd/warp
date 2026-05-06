@@ -33,6 +33,7 @@ const LOCAL_AGENT_MAX_TURNS: usize = 8;
 const LOCAL_TOOL_DEFAULT_GREP_MATCHES: usize = 100;
 const LOCAL_TOOL_MAX_GREP_BYTES: usize = 64_000;
 const LOCAL_TOOL_MAX_GREP_MATCHES: usize = 1_000;
+const LOCAL_TOOL_MAX_READ_BYTES: usize = 64_000;
 const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
@@ -584,6 +585,14 @@ fn local_openai_tools() -> Vec<Value> {
                         "path": {
                             "type": "string",
                             "description": "Workspace-relative file path to read"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Zero-based line offset to start reading from"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read"
                         }
                     },
                     "required": ["path"],
@@ -714,27 +723,65 @@ struct LocalToolResult {
 
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     match tool_call.name.as_str() {
-        "read_file" => {
-            let path = tool_call
-                .arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .context("read_file requires a non-empty path")?;
-            let resolved = resolve_workspace_path(workspace, path)?;
-            let content = fs::read_to_string(&resolved)
-                .with_context(|| format!("failed to read {}", resolved.display()))?;
-            Ok(LocalToolResult {
-                tool_call_id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                content,
-            })
-        }
+        "read_file" => execute_read_file_tool(tool_call, workspace),
         "write_file" => execute_write_file_tool(tool_call, workspace),
         "grep" => execute_grep_tool(tool_call, workspace),
         name => anyhow::bail!("unsupported local tool: {name}"),
     }
+}
+
+fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("read_file requires a non-empty path")?;
+    let offset = optional_usize_arg(&tool_call.arguments, "offset")?.unwrap_or(0);
+    let limit = optional_usize_arg(&tool_call.arguments, "limit")?;
+    if limit.is_some_and(|limit| limit == 0) {
+        anyhow::bail!("limit must be a positive integer");
+    }
+
+    let resolved = resolve_workspace_path(workspace, path)?;
+    let content = fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
+    let (content, was_truncated) = select_file_lines(&content, offset, limit);
+    let content = if was_truncated {
+        format!("{content}\n[read_file output truncated]\n")
+    } else {
+        content
+    };
+
+    Ok(LocalToolResult {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content,
+    })
+}
+
+fn select_file_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, bool) {
+    let mut selected = String::new();
+    let mut lines_read = 0usize;
+    let mut was_truncated = false;
+
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        if index < offset {
+            continue;
+        }
+        if limit.is_some_and(|limit| lines_read >= limit) {
+            break;
+        }
+        if selected.len() + line.len() > LOCAL_TOOL_MAX_READ_BYTES {
+            was_truncated = true;
+            break;
+        }
+        selected.push_str(line);
+        lines_read += 1;
+    }
+
+    (selected, was_truncated)
 }
 
 fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
@@ -1579,6 +1626,26 @@ mod tests {
     }
 
     #[test]
+    fn read_file_supports_offset_and_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("notes.md");
+        fs::write(&path, "line 1\nline 2\nline 3\nline 4\n").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({
+                "path": "notes.md",
+                "offset": 1,
+                "limit": 2
+            }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.content, "line 2\nline 3\n");
+    }
+
+    #[test]
     fn executes_write_file_tool_relative_to_workspace() {
         let tempdir = tempfile::tempdir().unwrap();
         let tool_call = LocalToolCall {
@@ -1719,6 +1786,8 @@ mod tests {
             tool["type"] == "function"
                 && tool["function"]["name"] == "read_file"
                 && tool["function"]["parameters"]["properties"]["path"]["type"] == "string"
+                && tool["function"]["parameters"]["properties"]["offset"]["type"] == "integer"
+                && tool["function"]["parameters"]["properties"]["limit"]["type"] == "integer"
         }));
         assert!(tools.iter().any(|tool| {
             tool["type"] == "function"
