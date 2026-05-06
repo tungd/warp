@@ -461,8 +461,14 @@ async fn generate_local_agent_output(
     match model.api_style.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => call_anthropic_compatible(&state.client, &model, &prompt).await,
         "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
-        | "gemini" | "openrouter" => call_openai_compatible(&state.client, &model, &prompt).await,
-        _ => call_openai_compatible(&state.client, &model, &prompt).await,
+        | "gemini" | "openrouter" => {
+            let workspace = workspace_for_request(request);
+            call_openai_compatible(&state.client, &model, &prompt, &workspace).await
+        }
+        _ => {
+            let workspace = workspace_for_request(request);
+            call_openai_compatible(&state.client, &model, &prompt, &workspace).await
+        }
     }
 }
 
@@ -516,22 +522,24 @@ async fn call_openai_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
     prompt: &str,
+    workspace: &Path,
 ) -> Result<String> {
+    run_openai_agent_loop(prompt, workspace, |messages| {
+        call_openai_chat_completion(client, model, messages)
+    })
+    .await
+}
+
+async fn call_openai_chat_completion(
+    client: &reqwest::Client,
+    model: &ResolvedLocalLlm,
+    messages: Vec<Value>,
+) -> Result<Value> {
     let url = completion_url(&model.base_url, "chat/completions");
-    let mut request = client.post(url).json(&json!({
-        "model": model.base_model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are running inside a local Warp OSS sidecar. Answer directly. Do not claim to have tool access."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "stream": false,
-    }));
+    let mut request = client.post(url).json(&openai_chat_completion_payload(
+        &model.base_model_name,
+        messages,
+    ));
     request = request.bearer_auth(&model.token);
 
     let response = request.send().await.context("failed to call local LLM")?;
@@ -544,8 +552,7 @@ async fn call_openai_compatible(
         anyhow::bail!("local LLM returned {status}: {body}");
     }
 
-    let value: Value = serde_json::from_str(&body).context("failed to parse local LLM response")?;
-    extract_openai_text(&value).context("local LLM response did not contain message content")
+    serde_json::from_str(&body).context("failed to parse local LLM response")
 }
 
 fn openai_chat_completion_payload(model_name: &str, messages: Vec<Value>) -> Value {
@@ -623,13 +630,6 @@ fn completion_url(base_url: &str, endpoint: &str) -> String {
     } else {
         format!("{base_url}/{endpoint}")
     }
-}
-
-fn extract_openai_text(value: &Value) -> Option<String> {
-    value
-        .pointer("/choices/0/message/content")
-        .and_then(text_value)
-        .or_else(|| value.pointer("/choices/0/text").and_then(text_value))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1465,5 +1465,94 @@ mod tests {
             workspace_for_request(&request),
             PathBuf::from("/tmp/warp-workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_call_runs_tools_against_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
+
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post({
+                let bodies = bodies.clone();
+                let calls = calls.clone();
+                move |Json(body): Json<Value>| {
+                    let bodies = bodies.clone();
+                    let calls = calls.clone();
+                    async move {
+                        bodies.lock().unwrap().push(body);
+                        match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 => Json(json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "id": "call_read",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"notes.md\"}"
+                                            }
+                                        }]
+                                    }
+                                }]
+                            })),
+                            _ => Json(json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "notes.md says: local notes"
+                                    }
+                                }]
+                            })),
+                        }
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let model = ResolvedLocalLlm {
+            id: "local".to_string(),
+            display_name: "Local".to_string(),
+            base_model_name: "qwen3.6-plus".to_string(),
+            base_url: format!("http://{addr}"),
+            api_style: "openai".to_string(),
+            token: "test-token".to_string(),
+            token_configured: true,
+        };
+
+        let output = call_openai_compatible(
+            &reqwest::Client::new(),
+            &model,
+            "What is in notes.md?",
+            tempdir.path(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(output, "notes.md says: local notes");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["type"] == "function" && tool["function"]["name"] == "read_file" }));
+        assert!(bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "call_read"
+                    && message["content"] == "local notes"
+            }));
     }
 }
