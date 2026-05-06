@@ -28,6 +28,7 @@ use warp_multi_agent_api as maa;
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
 const LOCAL_AGENT_MAX_TURNS: usize = 8;
+const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -566,24 +567,52 @@ fn openai_chat_completion_payload(model_name: &str, messages: Vec<Value>) -> Val
 }
 
 fn local_openai_tools() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a UTF-8 text file from the current workspace. The path must be relative to the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Workspace-relative file path to read"
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file from the current workspace. The path must be relative to the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path to read"
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
             }
-        }
-    })]
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a UTF-8 text file in the current workspace. The path must be relative to the workspace. Existing files require overwrite=true.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path to write"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Complete UTF-8 file contents"
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Set to true to replace an existing file"
+                        }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ]
 }
 
 async fn call_anthropic_compatible(
@@ -671,8 +700,52 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
                 content,
             })
         }
+        "write_file" => execute_write_file_tool(tool_call, workspace),
         name => anyhow::bail!("unsupported local tool: {name}"),
     }
+}
+
+fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("write_file requires a non-empty path")?;
+    let content = tool_call
+        .arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .context("write_file requires content")?;
+    let overwrite = tool_call
+        .arguments
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content_bytes = content.len();
+    if content_bytes > LOCAL_TOOL_MAX_WRITE_BYTES {
+        anyhow::bail!("write_file content exceeds {LOCAL_TOOL_MAX_WRITE_BYTES} bytes");
+    }
+
+    let resolved = resolve_workspace_path(workspace, path)?;
+    let file_existed = resolved.exists();
+    if file_existed && !overwrite {
+        anyhow::bail!("file exists at {path}; set overwrite=true to replace it");
+    }
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&resolved, content)
+        .with_context(|| format!("failed to write {}", resolved.display()))?;
+
+    let action = if file_existed { "Overwrote" } else { "Wrote" };
+    Ok(LocalToolResult {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content: format!("{action} {content_bytes} bytes to {path}."),
+    })
 }
 
 fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
@@ -1373,6 +1446,51 @@ mod tests {
         assert_eq!(result.content, "local notes");
     }
 
+    #[test]
+    fn executes_write_file_tool_relative_to_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "notes.md",
+                "content": "local notes"
+            }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.tool_call_id, "call_write");
+        assert_eq!(result.name, "write_file");
+        assert_eq!(
+            fs::read_to_string(tempdir.path().join("notes.md")).unwrap(),
+            "local notes"
+        );
+        assert!(result.content.contains("Wrote 11 bytes"));
+    }
+
+    #[test]
+    fn write_file_refuses_to_overwrite_without_flag() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "existing").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "notes.md",
+                "content": "new content"
+            }),
+        };
+
+        let err = execute_local_tool(&tool_call, tempdir.path()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("overwrite=true"));
+        assert_eq!(
+            fs::read_to_string(tempdir.path().join("notes.md")).unwrap(),
+            "existing"
+        );
+    }
+
     #[tokio::test]
     async fn agent_loop_sends_tool_result_back_to_model() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1441,6 +1559,11 @@ mod tests {
             tool["type"] == "function"
                 && tool["function"]["name"] == "read_file"
                 && tool["function"]["parameters"]["properties"]["path"]["type"] == "string"
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "function"
+                && tool["function"]["name"] == "write_file"
+                && tool["function"]["parameters"]["properties"]["content"]["type"] == "string"
         }));
     }
 
