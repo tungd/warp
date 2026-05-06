@@ -4,8 +4,9 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -30,7 +31,10 @@ use warp_multi_agent_api as maa;
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
 const LOCAL_AGENT_MAX_TURNS: usize = 8;
+const LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS: usize = 30;
 const LOCAL_TOOL_DEFAULT_GREP_MATCHES: usize = 100;
+const LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES: usize = 64_000;
+const LOCAL_TOOL_MAX_COMMAND_TIMEOUT_SECS: usize = 120;
 const LOCAL_TOOL_MAX_GREP_BYTES: usize = 64_000;
 const LOCAL_TOOL_MAX_GREP_MATCHES: usize = 1_000;
 const LOCAL_TOOL_MAX_READ_BYTES: usize = 64_000;
@@ -652,6 +656,28 @@ fn local_openai_tools() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a non-interactive shell command in the current workspace. Prefer read_file, grep, and write_file for file operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run"
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Timeout in seconds. Defaults to 30 and is capped at 120."
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -726,6 +752,7 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
         "read_file" => execute_read_file_tool(tool_call, workspace),
         "write_file" => execute_write_file_tool(tool_call, workspace),
         "grep" => execute_grep_tool(tool_call, workspace),
+        "bash" => execute_bash_tool(tool_call, workspace),
         name => anyhow::bail!("unsupported local tool: {name}"),
     }
 }
@@ -925,6 +952,135 @@ fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
             .with_context(|| format!("{name} must be a positive integer")),
         Some(_) => anyhow::bail!("{name} must be a positive integer"),
     }
+}
+
+struct LocalCommandOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn execute_bash_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
+    let command = tool_call
+        .arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .context("bash requires a non-empty command")?;
+    let timeout_secs = optional_usize_arg(&tool_call.arguments, "timeout_secs")?
+        .unwrap_or(LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS)
+        .clamp(1, LOCAL_TOOL_MAX_COMMAND_TIMEOUT_SECS);
+    let output =
+        run_local_shell_command(workspace, command, Duration::from_secs(timeout_secs as u64))?;
+
+    Ok(LocalToolResult {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content: format_command_output(command, &output),
+    })
+}
+
+fn run_local_shell_command(
+    workspace: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<LocalCommandOutput> {
+    let temp_id = Uuid::new_v4();
+    let stdout_path = std::env::temp_dir().join(format!("warp-oss-stdout-{temp_id}.txt"));
+    let stderr_path = std::env::temp_dir().join(format!("warp-oss-stderr-{temp_id}.txt"));
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut child = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg(command)
+        .current_dir(workspace)
+        .env("CI", "true")
+        .env("NONINTERACTIVE", "1")
+        .env("NO_TTY", "1")
+        .env("TERM", "dumb")
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .context("failed to run bash command")?;
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to poll bash command")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("failed to wait for killed bash command")?;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let stdout = read_capped_command_output(&stdout_path)?;
+    let stderr = read_capped_command_output(&stderr_path)?;
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+
+    Ok(LocalCommandOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn read_capped_command_output(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let was_truncated = bytes.len() > LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES;
+    let bytes = if was_truncated {
+        &bytes[..LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES]
+    } else {
+        &bytes
+    };
+    let mut output = String::from_utf8_lossy(bytes).into_owned();
+    if was_truncated {
+        output.push_str("\n[command output truncated]\n");
+    }
+    Ok(output)
+}
+
+fn format_command_output(command: &str, output: &LocalCommandOutput) -> String {
+    let exit_code = output
+        .exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    let mut result = format!("Command: {command}\nExit code: {exit_code}\n");
+    if output.timed_out {
+        result.push_str("Timed out: true\n");
+    }
+    if !output.stdout.is_empty() {
+        result.push_str("\nStdout:\n");
+        result.push_str(&output.stdout);
+        if !output.stdout.ends_with('\n') {
+            result.push('\n');
+        }
+    }
+    if !output.stderr.is_empty() {
+        result.push_str("\nStderr:\n");
+        result.push_str(&output.stderr);
+        if !output.stderr.ends_with('\n') {
+            result.push('\n');
+        }
+    }
+    result
 }
 
 fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
@@ -1718,6 +1874,32 @@ mod tests {
         assert!(!result.content.contains("README.md"));
     }
 
+    #[test]
+    fn executes_bash_tool_in_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_bash".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({
+                "command": "printf local > out.txt && pwd",
+                "timeout_secs": 5
+            }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.tool_call_id, "call_bash");
+        assert_eq!(result.name, "bash");
+        assert_eq!(
+            fs::read_to_string(tempdir.path().join("out.txt")).unwrap(),
+            "local"
+        );
+        assert!(result.content.contains("Exit code: 0"));
+        assert!(result
+            .content
+            .contains(&tempdir.path().display().to_string()));
+    }
+
     #[tokio::test]
     async fn agent_loop_sends_tool_result_back_to_model() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1798,6 +1980,11 @@ mod tests {
             tool["type"] == "function"
                 && tool["function"]["name"] == "grep"
                 && tool["function"]["parameters"]["properties"]["pattern"]["type"] == "string"
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "function"
+                && tool["function"]["name"] == "bash"
+                && tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
         }));
     }
 
