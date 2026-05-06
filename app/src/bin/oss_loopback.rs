@@ -19,15 +19,20 @@ use axum::{
 };
 use base64::{prelude::BASE64_URL_SAFE, Engine as _};
 use prost::Message as _;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
 const LOCAL_AGENT_MAX_TURNS: usize = 8;
+const LOCAL_TOOL_DEFAULT_GREP_MATCHES: usize = 100;
+const LOCAL_TOOL_MAX_GREP_BYTES: usize = 64_000;
+const LOCAL_TOOL_MAX_GREP_MATCHES: usize = 1_000;
 const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
@@ -612,6 +617,32 @@ fn local_openai_tools() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search workspace files for a Rust-regex pattern. The path must be relative to the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression to search for"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file or directory to search. Defaults to the workspace root."
+                        },
+                        "max_matches": {
+                            "type": "integer",
+                            "description": "Maximum number of matching lines to return"
+                        }
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -701,6 +732,7 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
             })
         }
         "write_file" => execute_write_file_tool(tool_call, workspace),
+        "grep" => execute_grep_tool(tool_call, workspace),
         name => anyhow::bail!("unsupported local tool: {name}"),
     }
 }
@@ -746,6 +778,106 @@ fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Resul
         name: tool_call.name.clone(),
         content: format!("{action} {content_bytes} bytes to {path}."),
     })
+}
+
+fn execute_grep_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
+    let pattern = tool_call
+        .arguments
+        .get("pattern")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .context("grep requires a non-empty pattern")?;
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
+    let max_matches = optional_usize_arg(&tool_call.arguments, "max_matches")?
+        .unwrap_or(LOCAL_TOOL_DEFAULT_GREP_MATCHES)
+        .clamp(1, LOCAL_TOOL_MAX_GREP_MATCHES);
+    let regex = Regex::new(pattern).with_context(|| format!("invalid grep pattern: {pattern}"))?;
+    let root = resolve_workspace_path(workspace, path)?;
+    if !root.exists() {
+        anyhow::bail!("grep path does not exist: {path}");
+    }
+
+    let mut content = String::new();
+    let mut match_count = 0usize;
+    let mut was_truncated = false;
+
+    'entries: for entry in WalkDir::new(&root)
+        .into_iter()
+        .filter_entry(should_visit_grep_entry)
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_content = match fs::read_to_string(entry.path()) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        for (index, line) in file_content.lines().enumerate() {
+            if !regex.is_match(line) {
+                continue;
+            }
+
+            let relative_path = entry.path().strip_prefix(workspace).unwrap_or(entry.path());
+            let rendered = format!(
+                "{}:{}:{}\n",
+                relative_path.display(),
+                index + 1,
+                line.trim_end_matches('\r')
+            );
+            if content.len() + rendered.len() > LOCAL_TOOL_MAX_GREP_BYTES {
+                was_truncated = true;
+                break 'entries;
+            }
+            content.push_str(&rendered);
+            match_count += 1;
+            if match_count >= max_matches {
+                was_truncated = true;
+                break 'entries;
+            }
+        }
+    }
+
+    if match_count == 0 {
+        content.push_str("No matches.\n");
+    } else if was_truncated {
+        content.push_str("Search results truncated.\n");
+    }
+
+    Ok(LocalToolResult {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content,
+    })
+}
+
+fn should_visit_grep_entry(entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    !matches!(
+        entry.file_name().to_str(),
+        Some(".git" | "node_modules" | "target" | ".venv" | "venv")
+    )
+}
+
+fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
+    match arguments.get(name) {
+        None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(|value| value as usize)
+            .map(Some)
+            .with_context(|| format!("{name} must be a positive integer")),
+        Some(_) => anyhow::bail!("{name} must be a positive integer"),
+    }
 }
 
 fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
@@ -1491,6 +1623,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn executes_grep_tool_relative_to_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tempdir.path().join("src")).unwrap();
+        fs::write(
+            tempdir.path().join("src/lib.rs"),
+            "alpha beta\nsecond line\n",
+        )
+        .unwrap();
+        fs::write(tempdir.path().join("README.md"), "alpha docs\n").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_grep".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({
+                "pattern": "alpha",
+                "path": "src",
+                "max_matches": 5
+            }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.tool_call_id, "call_grep");
+        assert_eq!(result.name, "grep");
+        assert!(result.content.contains("src/lib.rs:1:alpha beta"));
+        assert!(!result.content.contains("README.md"));
+    }
+
     #[tokio::test]
     async fn agent_loop_sends_tool_result_back_to_model() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1564,6 +1724,11 @@ mod tests {
             tool["type"] == "function"
                 && tool["function"]["name"] == "write_file"
                 && tool["function"]["parameters"]["properties"]["content"]["type"] == "string"
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "function"
+                && tool["function"]["name"] == "grep"
+                && tool["function"]["parameters"]["properties"]["pattern"]["type"] == "string"
         }));
     }
 
