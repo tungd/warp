@@ -14942,6 +14942,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp_terminal_ui"
+version = "0.1.0"
+dependencies = [
+ "pathfinder_color",
+ "warp_terminal",
+ "warpui",
+]
+
+[[package]]
 name = "warp_util"
 version = "0.1.0"
 dependencies = [
@@ -14976,6 +14985,16 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "warplite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pathfinder_color",
+ "warp_terminal_ui",
+ "warpui",
 ]
 
 [[package]]

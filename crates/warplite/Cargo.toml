@@ -1,0 +1,13 @@
+[package]
+name = "warplite"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pathfinder_color.workspace = true
+warpui.workspace = true
+warp_terminal_ui = { path = "../warp_terminal_ui" }

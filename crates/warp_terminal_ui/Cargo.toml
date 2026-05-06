@@ -1,0 +1,12 @@
+[package]
+name = "warp_terminal_ui"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+pathfinder_color.workspace = true
+warp_terminal.workspace = true
+warpui.workspace = true
