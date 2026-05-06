@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         platform::AppBuilder::new(platform::AppCallbacks::default(), Box::new(Assets), None);
 
     let _ = app_builder.run(move |ctx| {
+        root_view::init(ctx);
         ctx.add_window(
             AddWindowOptions {
                 title: Some("WarpLite".to_string()),

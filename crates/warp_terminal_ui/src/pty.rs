@@ -5,7 +5,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::{
         ffi::OsStrExt,
-        io::{FromRawFd, RawFd},
+        io::{AsRawFd, FromRawFd, RawFd},
     },
     path::{Path, PathBuf},
     ptr,
@@ -30,6 +30,13 @@ struct PtySessionInner {
     pid: libc::pid_t,
     writer: Mutex<File>,
     output_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    size: Mutex<Option<PtySize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 impl PtySession {
@@ -65,6 +72,7 @@ impl PtySession {
                 pid,
                 writer: Mutex::new(writer),
                 output_rx: Mutex::new(output_rx),
+                size: Mutex::new(None),
             }),
         })
     }
@@ -75,6 +83,18 @@ impl PtySession {
             .lock()
             .expect("pty writer mutex poisoned")
             .write_all(bytes)
+    }
+
+    pub fn resize(&self, size: PtySize) -> io::Result<()> {
+        let mut current_size = self.inner.size.lock().expect("pty size mutex poisoned");
+        if *current_size == Some(size) {
+            return Ok(());
+        }
+
+        let writer = self.inner.writer.lock().expect("pty writer mutex poisoned");
+        set_pty_size(writer.as_raw_fd(), size)?;
+        *current_size = Some(size);
+        Ok(())
     }
 
     pub fn drain_output(&self) -> Vec<Vec<u8>> {
@@ -150,6 +170,21 @@ fn home_dir() -> Option<PathBuf> {
 fn chdir(path: &Path) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())?;
     let rc = unsafe { libc::chdir(path.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn set_pty_size(fd: RawFd, size: PtySize) -> io::Result<()> {
+    let mut winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut winsize) };
     if rc == 0 {
         Ok(())
     } else {

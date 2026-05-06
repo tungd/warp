@@ -692,6 +692,10 @@ impl<'a, T: View> ViewContext<'a, T> {
             .close_window_async(self.window_id, TerminationMode::Cancellable);
     }
 
+    pub fn terminate_app(&mut self) {
+        self.app.terminate_app(TerminationMode::Cancellable, None);
+    }
+
     /// Minimizes the window which this View is in.
     pub fn minimize_window(&mut self) {
         if let Some(window) = self.app.windows().platform_window(self.window_id) {

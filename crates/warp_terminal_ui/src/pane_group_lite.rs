@@ -1,23 +1,29 @@
 use pathfinder_color::ColorU;
 use std::{path::PathBuf, time::Duration};
 use warp_terminal::shell::{ShellLaunchData, ShellType};
-use warpui::fonts::FamilyId;
 use warpui::{
     elements::{
         Border, ConstrainedBox, CrossAxisAlignment, DispatchEventResult, EventHandler, Flex,
         MainAxisAlignment, ParentElement, Rect, Stack, Text,
     },
+    fonts::FamilyId,
+    geometry::vector::Vector2F,
     keymap::Keystroke,
     r#async::Timer,
-    AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
+    AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, WindowId,
 };
 
-use crate::pty::{sanitize_terminal_bytes, PtySession};
+use crate::pty::{sanitize_terminal_bytes, PtySession, PtySize};
 
 const TAB_HEIGHT: f32 = 40.0;
+const PANE_TITLE_HEIGHT: f32 = 28.0;
 const PANE_GAP: f32 = 1.0;
 const MAX_TERMINAL_TEXT_BYTES: usize = 60_000;
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_CELL_WIDTH: f32 = 7.8;
+const TERMINAL_CELL_HEIGHT: f32 = 17.0;
+const MIN_PTY_COLS: u16 = 20;
+const MIN_PTY_ROWS: u16 = 3;
 
 #[derive(Debug, Clone)]
 pub enum PaneGroupLiteAction {
@@ -30,6 +36,7 @@ pub enum PaneGroupLiteAction {
     SplitDown,
     NewAgentPane,
     SendInput(Vec<u8>),
+    QuitApp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +79,7 @@ struct Tab {
 }
 
 pub struct PaneGroupLite {
+    window_id: WindowId,
     tabs: Vec<Tab>,
     active_tab: usize,
     next_tab_id: usize,
@@ -98,6 +106,7 @@ impl PaneGroupLite {
         };
 
         let view = Self {
+            window_id: ctx.window_id(),
             tabs: vec![Tab {
                 id: 1,
                 title: "shell".to_string(),
@@ -159,6 +168,19 @@ impl PaneGroupLite {
             did_drain |= drain_pane_node_output(&mut tab.root);
         }
         did_drain
+    }
+
+    fn resize_active_terminal_to_window(&self, app: &AppContext) {
+        let Some(window_bounds) = app.window_bounds(&self.window_id) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+
+        let window_size = window_bounds.size();
+        let pane_size = Vector2F::new(window_size.x(), (window_size.y() - TAB_HEIGHT).max(0.));
+        resize_pane_node(&tab.root, pane_size);
     }
 
     fn send_input_to_active_terminal(&mut self, bytes: &[u8]) {
@@ -331,7 +353,7 @@ impl PaneGroupLite {
                                 .with_color(ColorU::new(180, 180, 180, 255))
                                 .finish(),
                         )
-                        .with_height(28.)
+                        .with_height(PANE_TITLE_HEIGHT)
                         .finish(),
                     )
                     .with_child(
@@ -390,6 +412,55 @@ fn drain_pane_output(pane: &mut Pane) -> bool {
     }
 
     did_drain
+}
+
+fn resize_pane_node(node: &PaneNode, size: Vector2F) {
+    match node {
+        PaneNode::Leaf(pane) => resize_pane(pane, size),
+        PaneNode::Split {
+            direction,
+            first,
+            second,
+        } => match direction {
+            SplitDirection::Row => {
+                let child_width = ((size.x() - PANE_GAP) / 2.0).max(0.0);
+                let child_size = Vector2F::new(child_width, size.y());
+                resize_pane_node(first, child_size);
+                resize_pane_node(second, child_size);
+            }
+            SplitDirection::Column => {
+                let child_height = ((size.y() - PANE_GAP) / 2.0).max(0.0);
+                let child_size = Vector2F::new(size.x(), child_height);
+                resize_pane_node(first, child_size);
+                resize_pane_node(second, child_size);
+            }
+        },
+    }
+}
+
+fn resize_pane(pane: &Pane, size: Vector2F) {
+    if pane.kind != PaneKind::Terminal {
+        return;
+    }
+    let Some(session) = &pane.session else {
+        return;
+    };
+
+    let body_height = (size.y() - PANE_TITLE_HEIGHT).max(0.0);
+    let pty_size = PtySize {
+        cols: terminal_cells(size.x(), TERMINAL_CELL_WIDTH, MIN_PTY_COLS),
+        rows: terminal_cells(body_height, TERMINAL_CELL_HEIGHT, MIN_PTY_ROWS),
+    };
+    let _ = session.resize(pty_size);
+}
+
+fn terminal_cells(pixels: f32, cell_size: f32, minimum: u16) -> u16 {
+    let cells = if pixels.is_finite() && cell_size > 0.0 {
+        (pixels / cell_size).floor()
+    } else {
+        0.0
+    };
+    (cells as u32).clamp(minimum as u32, u16::MAX as u32) as u16
 }
 
 fn send_input_to_pane_node(node: &mut PaneNode, bytes: &[u8]) -> bool {
@@ -481,7 +552,9 @@ impl View for PaneGroupLite {
         "PaneGroupLite"
     }
 
-    fn render(&self, _: &AppContext) -> Box<dyn Element> {
+    fn render(&self, app: &AppContext) -> Box<dyn Element> {
+        self.resize_active_terminal_to_window(app);
+
         let active_root = self.tabs.get(self.active_tab).map(|tab| &tab.root);
 
         let mut layout = Flex::column()
@@ -561,6 +634,9 @@ impl TypedActionView for PaneGroupLite {
             }
             PaneGroupLiteAction::SendInput(bytes) => {
                 self.send_input_to_active_terminal(bytes);
+            }
+            PaneGroupLiteAction::QuitApp => {
+                ctx.terminate_app();
             }
         }
 
