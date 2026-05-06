@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
 use root_view::RootView;
 use std::borrow::Cow;
-use warpui::{platform, AssetProvider};
+use warpui::{
+    geometry::vector::Vector2F,
+    platform::{self, WindowBounds},
+    AddWindowOptions, AssetProvider,
+};
 
 mod root_view;
 
@@ -19,9 +23,14 @@ fn main() -> Result<()> {
         platform::AppBuilder::new(platform::AppCallbacks::default(), Box::new(Assets), None);
 
     let _ = app_builder.run(move |ctx| {
-        ctx.add_window(warpui::AddWindowOptions::default(), |ctx| {
-            RootView::new(ctx)
-        });
+        ctx.add_window(
+            AddWindowOptions {
+                title: Some("WarpLite".to_string()),
+                window_bounds: WindowBounds::ExactSize(Vector2F::new(1200., 760.)),
+                ..Default::default()
+            },
+            |ctx| RootView::new(ctx),
+        );
     });
 
     Ok(())
