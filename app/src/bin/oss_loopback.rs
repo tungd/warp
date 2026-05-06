@@ -502,6 +502,37 @@ async fn call_openai_compatible(
     extract_openai_text(&value).context("local LLM response did not contain message content")
 }
 
+fn openai_chat_completion_payload(model_name: &str, messages: Vec<Value>) -> Value {
+    json!({
+        "model": model_name,
+        "messages": messages,
+        "tools": local_openai_tools(),
+        "tool_choice": "auto",
+        "stream": false,
+    })
+}
+
+fn local_openai_tools() -> Vec<Value> {
+    vec![json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file from the current workspace. The path must be relative to the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative file path to read"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
+    })]
+}
+
 async fn call_anthropic_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
@@ -1346,5 +1377,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, "notes.md says: local notes");
+    }
+
+    #[test]
+    fn openai_payload_advertises_read_file_tool() {
+        let payload = openai_chat_completion_payload(
+            "qwen3.6-plus",
+            vec![json!({
+                "role": "user",
+                "content": "read notes.md"
+            })],
+        );
+
+        assert_eq!(payload["model"], "qwen3.6-plus");
+        let tools = payload["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "function"
+                && tool["function"]["name"] == "read_file"
+                && tool["function"]["parameters"]["properties"]["path"]["type"] == "string"
+        }));
     }
 }
