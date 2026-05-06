@@ -2,6 +2,9 @@
 // builds. See https://doc.rust-lang.org/reference/runtime.html#the-windows_subsystem-attribute.
 #![cfg_attr(feature = "release_bundle", windows_subsystem = "windows")]
 
+#[path = "oss_loopback.rs"]
+mod oss_loopback;
+
 use anyhow::Result;
 use warp_core::{
     channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig},
@@ -27,6 +30,9 @@ fn main() -> Result<()> {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
     ChannelState::set(state);
+
+    let _loopback_server = oss_loopback::LoopbackServer::spawn()?;
+    ChannelState::override_server_root_url(_loopback_server.server_root_url().to_owned())?;
 
     warp::run()
 }
