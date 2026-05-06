@@ -466,6 +466,52 @@ async fn generate_local_agent_output(
     }
 }
 
+#[allow(deprecated)]
+fn workspace_for_request(request: &maa::Request) -> PathBuf {
+    workspace_from_input_context(
+        request
+            .input
+            .as_ref()
+            .and_then(|input| input.context.as_ref()),
+    )
+    .or_else(|| workspace_from_task_context(request))
+    .unwrap_or_else(default_workspace)
+}
+
+fn workspace_from_input_context(context: Option<&maa::InputContext>) -> Option<PathBuf> {
+    context
+        .and_then(|context| context.directory.as_ref())
+        .and_then(|directory| path_from_pwd(&directory.pwd))
+}
+
+fn workspace_from_task_context(request: &maa::Request) -> Option<PathBuf> {
+    request
+        .task_context
+        .as_ref()?
+        .tasks
+        .iter()
+        .find_map(|task| {
+            task.messages
+                .iter()
+                .rev()
+                .find_map(|message| match message.message.as_ref()? {
+                    maa::message::Message::UserQuery(query) => {
+                        workspace_from_input_context(query.context.as_ref())
+                    }
+                    _ => None,
+                })
+        })
+}
+
+fn path_from_pwd(pwd: &str) -> Option<PathBuf> {
+    let pwd = pwd.trim();
+    (!pwd.is_empty()).then(|| PathBuf::from(pwd))
+}
+
+fn default_workspace() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 async fn call_openai_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
@@ -1396,5 +1442,28 @@ mod tests {
                 && tool["function"]["name"] == "read_file"
                 && tool["function"]["parameters"]["properties"]["path"]["type"] == "string"
         }));
+    }
+
+    #[test]
+    fn extracts_workspace_from_request_context_directory() {
+        let request = maa::Request {
+            input: Some(maa::request::Input {
+                context: Some(maa::InputContext {
+                    directory: Some(maa::input_context::Directory {
+                        pwd: "/tmp/warp-workspace".to_string(),
+                        home: "/tmp".to_string(),
+                        pwd_file_symbols_indexed: false,
+                    }),
+                    ..Default::default()
+                }),
+                r#type: None,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            workspace_for_request(&request),
+            PathBuf::from("/tmp/warp-workspace")
+        );
     }
 }
