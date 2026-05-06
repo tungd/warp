@@ -4,9 +4,10 @@ use warp_terminal::shell::{ShellLaunchData, ShellType};
 use warpui::fonts::FamilyId;
 use warpui::{
     elements::{
-        Border, ConstrainedBox, CrossAxisAlignment, Flex, MainAxisAlignment, ParentElement, Rect,
-        Stack, Text,
+        Border, ConstrainedBox, CrossAxisAlignment, DispatchEventResult, EventHandler, Flex,
+        MainAxisAlignment, ParentElement, Rect, Stack, Text,
     },
+    keymap::Keystroke,
     r#async::Timer,
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
 };
@@ -27,6 +28,7 @@ pub enum PaneGroupLiteAction {
     SplitRight,
     SplitDown,
     NewAgentPane,
+    SendInput(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,7 @@ impl PaneGroupLite {
                 .load_system_font("Menlo")
                 .expect("Menlo should be available on macOS")
         });
+        ctx.focus_self();
 
         let first_pane = Pane {
             id: 1,
@@ -155,6 +158,12 @@ impl PaneGroupLite {
             did_drain |= drain_pane_node_output(&mut tab.root);
         }
         did_drain
+    }
+
+    fn send_input_to_active_terminal(&mut self, bytes: &[u8]) {
+        if let Some(tab) = self.active_tab_mut() {
+            send_input_to_pane_node(&mut tab.root, bytes);
+        }
     }
 
     fn split_active_leaf(&mut self, direction: SplitDirection, kind: PaneKind) {
@@ -359,6 +368,71 @@ fn drain_pane_output(pane: &mut Pane) -> bool {
     did_drain
 }
 
+fn send_input_to_pane_node(node: &mut PaneNode, bytes: &[u8]) -> bool {
+    match node {
+        PaneNode::Leaf(pane) => {
+            if pane.kind == PaneKind::Terminal {
+                if let Some(session) = &pane.session {
+                    let _ = session.write(bytes);
+                    return true;
+                }
+            }
+            false
+        }
+        PaneNode::Split { first, second, .. } => {
+            send_input_to_pane_node(first, bytes) || send_input_to_pane_node(second, bytes)
+        }
+    }
+}
+
+fn keystroke_to_terminal_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    if keystroke.cmd || keystroke.meta || keystroke.alt {
+        return None;
+    }
+
+    match keystroke.key.as_str() {
+        "enter" | "numpadenter" if !keystroke.ctrl => Some(b"\r".to_vec()),
+        "tab" if !keystroke.ctrl => Some(b"\t".to_vec()),
+        "backspace" if !keystroke.ctrl => Some(vec![0x7f]),
+        "escape" if !keystroke.ctrl => Some(vec![0x1b]),
+        "up" if !keystroke.ctrl => Some(b"\x1b[A".to_vec()),
+        "down" if !keystroke.ctrl => Some(b"\x1b[B".to_vec()),
+        "right" if !keystroke.ctrl => Some(b"\x1b[C".to_vec()),
+        "left" if !keystroke.ctrl => Some(b"\x1b[D".to_vec()),
+        "home" if !keystroke.ctrl => Some(b"\x1b[H".to_vec()),
+        "end" if !keystroke.ctrl => Some(b"\x1b[F".to_vec()),
+        "pageup" if !keystroke.ctrl => Some(b"\x1b[5~".to_vec()),
+        "pagedown" if !keystroke.ctrl => Some(b"\x1b[6~".to_vec()),
+        "delete" if !keystroke.ctrl => Some(b"\x1b[3~".to_vec()),
+        key if key.chars().count() == 1 => {
+            let ch = key.chars().next()?;
+            if keystroke.ctrl {
+                ascii_control_byte(ch).map(|byte| vec![byte])
+            } else {
+                Some(key.as_bytes().to_vec())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ascii_control_byte(ch: char) -> Option<u8> {
+    let ch = ch.to_ascii_uppercase();
+    if ch.is_ascii_alphabetic() {
+        Some((ch as u8) & 0x1f)
+    } else {
+        match ch {
+            ' ' => Some(0x00),
+            '[' => Some(0x1b),
+            '\\' => Some(0x1c),
+            ']' => Some(0x1d),
+            '^' => Some(0x1e),
+            '_' => Some(0x1f),
+            _ => None,
+        }
+    }
+}
+
 fn split_first_leaf(node: &mut PaneNode, direction: SplitDirection, new_pane: Pane) {
     match node {
         PaneNode::Leaf(existing) => {
@@ -397,7 +471,17 @@ impl View for PaneGroupLite {
             )));
         }
 
-        layout.finish()
+        EventHandler::new(layout.finish())
+            .with_always_handle()
+            .on_keydown(|event, _, keystroke| {
+                if let Some(bytes) = keystroke_to_terminal_bytes(keystroke) {
+                    event.dispatch_typed_action(PaneGroupLiteAction::SendInput(bytes));
+                    DispatchEventResult::StopPropagation
+                } else {
+                    DispatchEventResult::PropagateToParent
+                }
+            })
+            .finish()
     }
 }
 
@@ -445,6 +529,9 @@ impl TypedActionView for PaneGroupLite {
             }
             PaneGroupLiteAction::NewAgentPane => {
                 self.split_active_leaf(SplitDirection::Row, PaneKind::Agent);
+            }
+            PaneGroupLiteAction::SendInput(bytes) => {
+                self.send_input_to_active_terminal(bytes);
             }
         }
 
