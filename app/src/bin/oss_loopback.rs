@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -26,6 +27,7 @@ use warp_multi_agent_api as maa;
 
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
+const LOCAL_AGENT_MAX_TURNS: usize = 8;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -691,6 +693,76 @@ fn text_value(value: &Value) -> Option<String> {
     }
 }
 
+async fn run_openai_agent_loop<F, Fut>(
+    prompt: &str,
+    workspace: &Path,
+    mut complete: F,
+) -> Result<String>
+where
+    F: FnMut(Vec<Value>) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    let mut messages = vec![
+        json!({
+            "role": "system",
+            "content": "You are running inside a local Warp OSS sidecar. Answer directly and use local tools when they are useful."
+        }),
+        json!({
+            "role": "user",
+            "content": prompt
+        }),
+    ];
+
+    for _ in 0..LOCAL_AGENT_MAX_TURNS {
+        let response = complete(messages.clone()).await?;
+        let turn = parse_openai_assistant_turn(&response)?;
+        if turn.tool_calls.is_empty() {
+            return Ok(turn.content);
+        }
+
+        messages.push(openai_assistant_message(&turn));
+        for tool_call in &turn.tool_calls {
+            let result =
+                execute_local_tool(tool_call, workspace).unwrap_or_else(|err| LocalToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    content: format!("Tool failed: {err:#}"),
+                });
+            messages.push(openai_tool_result_message(&result));
+        }
+    }
+
+    anyhow::bail!("local agent exceeded {LOCAL_AGENT_MAX_TURNS} tool turns")
+}
+
+fn openai_assistant_message(turn: &LocalAssistantTurn) -> Value {
+    json!({
+        "role": "assistant",
+        "content": turn.content,
+        "tool_calls": turn.tool_calls.iter().map(openai_tool_call_message).collect::<Vec<_>>(),
+    })
+}
+
+fn openai_tool_call_message(tool_call: &LocalToolCall) -> Value {
+    json!({
+        "id": tool_call.id,
+        "type": "function",
+        "function": {
+            "name": tool_call.name,
+            "arguments": tool_call.arguments.to_string(),
+        }
+    })
+}
+
+fn openai_tool_result_message(result: &LocalToolResult) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": result.tool_call_id,
+        "name": result.name,
+        "content": result.content,
+    })
+}
+
 fn agent_response_events(request: &maa::Request, output: String) -> Vec<maa::ResponseEvent> {
     let stream_ids = stream_ids(request);
     let task_info = task_info(request);
@@ -1222,5 +1294,57 @@ mod tests {
         assert_eq!(result.tool_call_id, "call_read");
         assert_eq!(result.name, "read_file");
         assert_eq!(result.content, "local notes");
+    }
+
+    #[tokio::test]
+    async fn agent_loop_sends_tool_result_back_to_model() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let output = run_openai_agent_loop("What is in notes.md?", tempdir.path(), {
+            let calls = calls.clone();
+            move |messages: Vec<Value>| {
+                let calls = calls.clone();
+                async move {
+                    match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => Ok(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "call_read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": "{\"path\":\"notes.md\"}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        })),
+                        1 => {
+                            assert!(messages.iter().any(|message| {
+                                message["role"] == "tool"
+                                    && message["tool_call_id"] == "call_read"
+                                    && message["content"] == "local notes"
+                            }));
+                            Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "notes.md says: local notes"
+                                    }
+                                }]
+                            }))
+                        }
+                        _ => panic!("agent loop called the model too many times"),
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(output, "notes.md says: local notes");
     }
 }
