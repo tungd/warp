@@ -1,24 +1,26 @@
 use pathfinder_color::ColorU;
 use std::{path::PathBuf, time::Duration};
+use warp_terminal::model::escape_sequences::{KeystrokeWithDetails, ToEscapeSequence};
 use warp_terminal::shell::{ShellLaunchData, ShellType};
 use warpui::{
     elements::{
         Border, ConstrainedBox, CrossAxisAlignment, DispatchEventResult, EventHandler, Flex,
-        MainAxisAlignment, ParentElement, Rect, Stack, Text,
+        Highlight, HighlightedRange, MainAxisAlignment, ParentElement, Rect, Stack, Text,
     },
-    fonts::FamilyId,
+    fonts::{FamilyId, Properties, Style, Weight},
     geometry::vector::Vector2F,
     keymap::Keystroke,
     r#async::Timer,
+    text_layout::TextStyle,
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, WindowId,
 };
 
-use crate::pty::{sanitize_terminal_bytes, PtySession, PtySize};
+use crate::pty::{PtySession, PtySize};
+use crate::terminal_screen::{RenderedCell, RenderedRow, TerminalInputMode, TerminalScreen};
 
 const TAB_HEIGHT: f32 = 40.0;
 const PANE_TITLE_HEIGHT: f32 = 28.0;
 const PANE_GAP: f32 = 1.0;
-const MAX_TERMINAL_TEXT_BYTES: usize = 60_000;
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const TERMINAL_CELL_WIDTH: f32 = 7.8;
 const TERMINAL_CELL_HEIGHT: f32 = 17.0;
@@ -58,7 +60,7 @@ struct Pane {
     title: String,
     launch: Option<ShellLaunchData>,
     session: Option<PtySession>,
-    output: String,
+    screen: TerminalScreen,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +104,7 @@ impl PaneGroupLite {
             title: "shell".to_string(),
             launch: login_shell_launch_data(),
             session: login_shell_session(),
-            output: String::new(),
+            screen: TerminalScreen::new(80, 24),
         };
 
         let view = Self {
@@ -143,7 +145,7 @@ impl PaneGroupLite {
             session: (kind == PaneKind::Terminal)
                 .then(login_shell_session)
                 .flatten(),
-            output: String::new(),
+            screen: TerminalScreen::new(80, 24),
         }
     }
 
@@ -187,6 +189,12 @@ impl PaneGroupLite {
         if let Some(tab) = self.active_tab_mut() {
             send_input_to_pane_node(&mut tab.root, bytes);
         }
+    }
+
+    fn active_terminal_input_mode(&self) -> Option<TerminalInputMode> {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| first_terminal_input_mode(&tab.root))
     }
 
     fn split_active_leaf(&mut self, direction: SplitDirection, kind: PaneKind) {
@@ -329,13 +337,10 @@ impl PaneGroupLite {
     fn render_pane(&self, pane: &Pane) -> Box<dyn Element> {
         let title = format!("{} · {}", pane.title, pane.id);
         let body = match pane.kind {
-            PaneKind::Terminal if pane.output.is_empty() => pane
-                .launch
-                .as_ref()
-                .map(|launch| format!("starting {}", launch.shell_detail()))
-                .unwrap_or_else(|| "starting login shell".to_string()),
-            PaneKind::Terminal => pane.output.clone(),
-            PaneKind::Agent => "local rich input placeholder".to_string(),
+            PaneKind::Terminal => self.render_terminal_screen(pane),
+            PaneKind::Agent => Text::new("local rich input placeholder", self.font_family, 13.0)
+                .with_color(ColorU::new(235, 235, 235, 255))
+                .finish(),
         };
 
         Stack::new()
@@ -356,14 +361,37 @@ impl PaneGroupLite {
                         .with_height(PANE_TITLE_HEIGHT)
                         .finish(),
                     )
-                    .with_child(
-                        Text::new(body, self.font_family, 13.0)
-                            .with_color(ColorU::new(235, 235, 235, 255))
-                            .finish(),
-                    )
+                    .with_child(body)
                     .finish(),
             )
             .finish()
+    }
+
+    fn render_terminal_screen(&self, pane: &Pane) -> Box<dyn Element> {
+        let rows = pane.screen.rendered_rows();
+        if rows
+            .iter()
+            .all(|row| row.cells.iter().all(|cell| cell.ch == ' '))
+        {
+            let body = pane
+                .launch
+                .as_ref()
+                .map(|launch| format!("starting {}", launch.shell_detail()))
+                .unwrap_or_else(|| "starting login shell".to_string());
+            return Text::new(body, self.font_family, 13.0)
+                .with_color(ColorU::new(235, 235, 235, 255))
+                .finish();
+        }
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_main_axis_alignment(MainAxisAlignment::Start);
+
+        for row in rows {
+            column.add_child(render_terminal_row(row, self.font_family));
+        }
+
+        column.finish()
     }
 }
 
@@ -401,14 +429,17 @@ fn drain_pane_output(pane: &mut Pane) -> bool {
     };
 
     let mut did_drain = false;
-    for bytes in session.drain_output() {
-        pane.output.push_str(&sanitize_terminal_bytes(&bytes));
-        did_drain = true;
+    if let Some(size) = session.current_size() {
+        pane.screen.resize(size.cols, size.rows);
     }
-
-    if pane.output.len() > MAX_TERMINAL_TEXT_BYTES {
-        let keep_from = pane.output.len() - MAX_TERMINAL_TEXT_BYTES;
-        pane.output = pane.output[keep_from..].to_string();
+    for bytes in session.drain_output() {
+        for response in pane.screen.process(&bytes) {
+            let _ = session.write(&response);
+        }
+        if let Some(title) = pane.screen.title() {
+            pane.title = title.to_string();
+        }
+        did_drain = true;
     }
 
     did_drain
@@ -480,9 +511,24 @@ fn send_input_to_pane_node(node: &mut PaneNode, bytes: &[u8]) -> bool {
     }
 }
 
-fn keystroke_to_terminal_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
-    if keystroke.cmd || keystroke.meta || keystroke.alt {
+fn keystroke_to_terminal_bytes(
+    keystroke: &Keystroke,
+    mode: Option<TerminalInputMode>,
+) -> Option<Vec<u8>> {
+    if keystroke.cmd {
         return None;
+    }
+
+    if let Some(mode) = mode {
+        if let Some(bytes) = (KeystrokeWithDetails {
+            keystroke,
+            key_without_modifiers: Some(keystroke.key.as_str()),
+            chars: printable_chars_for_keystroke(keystroke),
+        })
+        .to_escape_sequence(&mode)
+        {
+            return Some(bytes);
+        }
     }
 
     match keystroke.key.as_str() {
@@ -508,6 +554,14 @@ fn keystroke_to_terminal_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
             }
         }
         _ => None,
+    }
+}
+
+fn printable_chars_for_keystroke(keystroke: &Keystroke) -> Option<&str> {
+    if !keystroke.ctrl && !keystroke.cmd && keystroke.key.chars().count() == 1 {
+        Some(keystroke.key.as_str())
+    } else {
+        None
     }
 }
 
@@ -543,6 +597,78 @@ fn split_first_leaf(node: &mut PaneNode, direction: SplitDirection, new_pane: Pa
     }
 }
 
+fn first_terminal_input_mode(node: &PaneNode) -> Option<TerminalInputMode> {
+    match node {
+        PaneNode::Leaf(pane) if pane.kind == PaneKind::Terminal => Some(pane.screen.input_mode()),
+        PaneNode::Leaf(_) => None,
+        PaneNode::Split { first, second, .. } => {
+            first_terminal_input_mode(first).or_else(|| first_terminal_input_mode(second))
+        }
+    }
+}
+
+fn render_terminal_row(row: RenderedRow, font_family: FamilyId) -> Box<dyn Element> {
+    let text = row.cells.iter().map(|cell| cell.ch).collect::<String>();
+    let highlights = terminal_row_highlights(&row.cells);
+
+    ConstrainedBox::new(
+        Text::new_inline(text, font_family, 13.0)
+            .with_line_height_ratio(1.0)
+            .with_color(ColorU::new(238, 238, 229, 255))
+            .with_highlights(highlights)
+            .finish(),
+    )
+    .with_height(TERMINAL_CELL_HEIGHT)
+    .finish()
+}
+
+fn terminal_row_highlights(cells: &[RenderedCell]) -> Vec<HighlightedRange> {
+    let mut highlights = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        let mut end = start + 1;
+        while end < cells.len() && same_cell_style(cells[start], cells[end]) {
+            end += 1;
+        }
+
+        let mut text_style = TextStyle::new()
+            .with_foreground_color(cells[start].fg)
+            .with_background_color(cells[start].bg);
+        if cells[start].underline {
+            text_style = text_style.with_underline_color(cells[start].fg);
+        }
+
+        highlights.push(HighlightedRange {
+            highlight: Highlight::new()
+                .with_properties(font_properties_for_cell(cells[start]))
+                .with_text_style(text_style),
+            highlight_indices: (start..end).collect(),
+        });
+        start = end;
+    }
+
+    highlights
+}
+
+fn same_cell_style(left: RenderedCell, right: RenderedCell) -> bool {
+    left.fg == right.fg
+        && left.bg == right.bg
+        && left.bold == right.bold
+        && left.italic == right.italic
+        && left.underline == right.underline
+}
+
+fn font_properties_for_cell(cell: RenderedCell) -> Properties {
+    let mut properties = Properties::default();
+    if cell.bold {
+        properties = properties.weight(Weight::Bold);
+    }
+    if cell.italic {
+        properties = properties.style(Style::Italic);
+    }
+    properties
+}
+
 impl Entity for PaneGroupLite {
     type Event = ();
 }
@@ -556,6 +682,7 @@ impl View for PaneGroupLite {
         self.resize_active_terminal_to_window(app);
 
         let active_root = self.tabs.get(self.active_tab).map(|tab| &tab.root);
+        let input_mode = self.active_terminal_input_mode();
 
         let mut layout = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -570,8 +697,8 @@ impl View for PaneGroupLite {
 
         EventHandler::new(layout.finish())
             .with_always_handle()
-            .on_keydown(|event, _, keystroke| {
-                if let Some(bytes) = keystroke_to_terminal_bytes(keystroke) {
+            .on_keydown(move |event, _, keystroke| {
+                if let Some(bytes) = keystroke_to_terminal_bytes(keystroke, input_mode) {
                     event.dispatch_typed_action(PaneGroupLiteAction::SendInput(bytes));
                     DispatchEventResult::StopPropagation
                 } else {

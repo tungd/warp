@@ -97,6 +97,10 @@ impl PtySession {
         Ok(())
     }
 
+    pub fn current_size(&self) -> Option<PtySize> {
+        *self.inner.size.lock().expect("pty size mutex poisoned")
+    }
+
     pub fn drain_output(&self) -> Vec<Vec<u8>> {
         let rx = self
             .inner
@@ -201,57 +205,4 @@ fn set_env(key: &str, value: &str) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-pub fn sanitize_terminal_bytes(bytes: &[u8]) -> String {
-    #[derive(Clone, Copy)]
-    enum State {
-        Ground,
-        Escape,
-        Csi,
-        Osc,
-        OscEscape,
-    }
-
-    let mut state = State::Ground;
-    let mut output = String::new();
-
-    for byte in String::from_utf8_lossy(bytes).bytes() {
-        match state {
-            State::Ground => match byte {
-                0x1b => state = State::Escape,
-                b'\n' | b'\t' => output.push(byte as char),
-                b'\r' => {}
-                0x08 => {
-                    output.pop();
-                }
-                0x20..=0x7e => output.push(byte as char),
-                _ => {}
-            },
-            State::Escape => match byte {
-                b'[' => state = State::Csi,
-                b']' => state = State::Osc,
-                _ => state = State::Ground,
-            },
-            State::Csi => {
-                if (0x40..=0x7e).contains(&byte) {
-                    state = State::Ground;
-                }
-            }
-            State::Osc => match byte {
-                0x07 => state = State::Ground,
-                0x1b => state = State::OscEscape,
-                _ => {}
-            },
-            State::OscEscape => {
-                state = if byte == b'\\' {
-                    State::Ground
-                } else {
-                    State::Osc
-                };
-            }
-        }
-    }
-
-    output
 }

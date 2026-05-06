@@ -9,5 +9,7 @@ license.workspace = true
 [dependencies]
 libc.workspace = true
 pathfinder_color.workspace = true
+unicode-width.workspace = true
+vte.workspace = true
 warp_terminal.workspace = true
 warpui.workspace = true

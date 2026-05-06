@@ -14947,6 +14947,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "pathfinder_color",
+ "unicode-width 0.1.14",
+ "vte",
  "warp_terminal",
  "warpui",
 ]
