@@ -41,8 +41,10 @@ ENTITLEMENTS ?= script/Debug-Entitlements.plist
 # You can also pass an explicit identity:
 #   make install CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
 CODESIGN_IDENTITY ?= auto
+LLM_SOURCE_PATH ?=
+LLM_DEST_PATH ?= $(HOME)/.warp-oss/llm.toml
 
-.PHONY: help print-config build build-universal bundle bundle-universal sign sign-universal prepare-bundle install install-universal install-bundle run uninstall signing-identities clean-bundle
+.PHONY: help print-config build build-universal bundle bundle-universal sign sign-universal prepare-bundle install install-universal install-bundle run uninstall signing-identities clean-bundle sync-llm-config
 
 help:
 	@printf '%s\n' \
@@ -57,6 +59,7 @@ help:
 		'  make uninstall           Remove the installed local bundle' \
 		'  make signing-identities  List local codesigning identities' \
 		'  make clean-bundle        Remove the generated app bundle' \
+		'  make sync-llm-config     Copy default LLM config into ~/.warp-oss/llm.toml' \
 		'' \
 		'Useful overrides:' \
 		'  CARGO=cargo|/path/to/cargo' \
@@ -65,6 +68,8 @@ help:
 		'  BUNDLE_FEATURES=release_bundle|"<features>"' \
 		'  CODESIGN_IDENTITY=auto|"-"|"<identity>"' \
 		'  INSTALL_DIR=/Applications' \
+		'  LLM_SOURCE_PATH=/path/to/vibe-or-llm-config.toml' \
+		'  LLM_DEST_PATH=/path/to/.warp-oss/llm.toml' \
 		'  OPEN_AFTER_INSTALL=1'
 
 print-config:
@@ -215,3 +220,8 @@ signing-identities:
 
 clean-bundle:
 	rm -rf '$(APP_PATH)'
+
+sync-llm-config:
+	LLM_SOURCE_PATH="$(LLM_SOURCE_PATH)" \
+	LLM_DEST_PATH="$(LLM_DEST_PATH)" \
+	./script/sync-warp-oss-llm.sh
