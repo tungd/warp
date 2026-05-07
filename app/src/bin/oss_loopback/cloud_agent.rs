@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use super::{worker_discovery, ServerState};
+use super::{probe_discovery, worker_discovery, ServerState};
 
 pub(crate) type CloudAgentRunStore = Arc<RwLock<HashMap<String, CloudAgentRunRecord>>>;
 
@@ -293,12 +293,15 @@ async fn spawn_agent_run(
         return Err(json_error(StatusCode::BAD_REQUEST, "prompt is required"));
     }
 
-    let worker_host = worker_host_from_config(&state, request.config.as_ref()).await;
-    let Some(worker) = worker_discovery::find_worker(&state.discovered_workers, &worker_host).await
+    let Some((worker_host, worker)) =
+        worker_for_spawn_request(&state, request.config.as_ref()).await
     else {
         return Err(json_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            &format!("no WarpSOLO worker is available for host '{worker_host}'"),
+            &format!(
+                "no WarpSOLO worker is available for host '{}'",
+                worker_host_from_config(&state, request.config.as_ref()).await
+            ),
         ));
     };
     let workspace = workspace_from_spawn_request(&request)?;
@@ -344,6 +347,24 @@ async fn spawn_agent_run(
         "run_id": run_id,
         "at_capacity": false,
     }))
+}
+
+async fn worker_for_spawn_request(
+    state: &ServerState,
+    config: Option<&Value>,
+) -> Option<(String, worker_discovery::DiscoveredWorker)> {
+    let worker_host = worker_host_from_config(state, config).await;
+    if let Some(worker) =
+        worker_discovery::find_worker(&state.discovered_workers, &worker_host).await
+    {
+        return Some((worker_host, worker));
+    }
+
+    probe_discovery::refresh(state).await;
+    let worker_host = worker_host_from_config(state, config).await;
+    worker_discovery::find_worker(&state.discovered_workers, &worker_host)
+        .await
+        .map(|worker| (worker_host, worker))
 }
 
 async fn create_worker_run(

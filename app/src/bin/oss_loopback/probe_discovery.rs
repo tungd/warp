@@ -31,6 +31,14 @@ pub(crate) fn start(state: ServerState, runtime: &Runtime) {
     });
 }
 
+pub(crate) async fn refresh(state: &ServerState) {
+    let port = state.worker_config.port();
+    if port == 0 {
+        return;
+    }
+    discover_once(state, port).await;
+}
+
 async fn discover_once(state: &ServerState, port: u16) {
     let candidates = probe_candidates(port).await;
     let mut current_probe_source_ids = HashSet::new();
