@@ -1906,6 +1906,10 @@ fn launch_remote_child(
             }
         }
     };
+    let workspace = group
+        .terminal_view_from_pane_id(parent_pane_id, ctx)
+        .and_then(|terminal_view| terminal_view.as_ref(ctx).active_session_path_if_local(ctx))
+        .map(|path| path.display().to_string());
     let spawn_request = SpawnAgentRequest {
         prompt: request.prompt,
         mode: UserQueryMode::Normal,
@@ -1926,6 +1930,7 @@ fn launch_remote_child(
         runtime_skills,
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace,
         initial_snapshot_token: None,
         agent_identity_uid: None,
     };

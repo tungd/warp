@@ -1034,6 +1034,7 @@ impl AmbientAgentViewModel {
             runtime_skills: vec![],
             referenced_attachments: vec![],
             conversation_id: None,
+            workspace: None,
             initial_snapshot_token: None,
         };
 
@@ -1464,10 +1465,28 @@ impl AmbientAgentViewModel {
         handoff.submission_state = HandoffSubmissionState::Starting;
         ctx.emit(AmbientAgentViewModelEvent::PendingHandoffChanged);
 
+            interactive: None,
+            parent_run_id: None,
+            runtime_skills: vec![],
+            referenced_attachments: vec![],
+            conversation_id: Some(forked_conversation_id),
+            workspace: None,
+>>>>>>> 11d2289f (Pass workspace to WarpSOLO worker spawns)
+            initial_snapshot_token,
+=======
         let request = self.build_handoff_spawn_request(
             prompt,
             attachments,
             forked_conversation_id,
+            initial_snapshot_token,
+=======
+            interactive: None,
+            parent_run_id: None,
+            runtime_skills: vec![],
+            referenced_attachments: vec![],
+            conversation_id: Some(forked_conversation_id),
+            workspace: None,
+>>>>>>> 11d2289f (Pass workspace to WarpSOLO worker spawns)
             initial_snapshot_token,
             ctx,
         );

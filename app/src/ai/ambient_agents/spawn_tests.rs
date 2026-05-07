@@ -373,6 +373,7 @@ async fn poll_retries_transient_429_errors() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 
@@ -440,6 +441,7 @@ async fn poll_fails_on_permanent_http_error() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 
@@ -507,6 +509,7 @@ async fn poll_gives_up_after_max_transient_retries() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 
@@ -569,6 +572,7 @@ async fn poll_stops_on_terminal_failure_like_state() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 
@@ -714,6 +718,7 @@ async fn poll_for_session_join_info_waits_until_link_is_available() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 

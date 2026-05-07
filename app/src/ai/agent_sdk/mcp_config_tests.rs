@@ -286,6 +286,7 @@ fn serializes_mcp_servers_as_object_not_string() {
         runtime_skills: vec![],
         referenced_attachments: vec![],
         conversation_id: None,
+        workspace: None,
         initial_snapshot_token: None,
     };
 

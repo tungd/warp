@@ -240,6 +240,9 @@ pub struct SpawnAgentRequest {
     /// `POST /agent/conversations/{conversation_id}/fork` at chip-click time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Local workspace path for OSS/self-hosted workers. Ignored by Warp-hosted cloud workers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// References a batch of files previously uploaded to handoff/{token}/
     /// via `POST /agent/handoff/upload-snapshot`. The server stores the token on the new run's
     /// queued execution input and resolves the prefix in place at rehydration time.
