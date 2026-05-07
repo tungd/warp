@@ -193,6 +193,7 @@ impl LocalLlmConfig {
             api_style: api_style.to_owned(),
             token,
             token_configured: true,
+            headers: provider.resolved_headers(),
         })
     }
 }
@@ -205,6 +206,8 @@ struct LocalLlmProviderConfig {
     api_key: Option<String>,
     token: Option<String>,
     api_style: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 impl LocalLlmProviderConfig {
@@ -224,6 +227,14 @@ impl LocalLlmProviderConfig {
                     .map(|token| token.trim().to_owned())
                     .filter(|token| !token.is_empty())
             })
+    }
+
+    fn resolved_headers(&self) -> Vec<(String, String)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+            .collect()
     }
 }
 
@@ -267,6 +278,7 @@ struct ResolvedLocalLlm {
     api_style: String,
     token: String,
     token_configured: bool,
+    headers: Vec<(String, String)>,
 }
 
 impl ResolvedLocalLlm {
@@ -556,6 +568,7 @@ async fn call_openai_chat_completion(
         &model.base_model_name,
         messages,
     ));
+    request = apply_configured_headers(request, model)?;
     request = request.bearer_auth(&model.token);
 
     let response = request.send().await.context("failed to call local LLM")?;
@@ -733,6 +746,7 @@ async fn call_anthropic_compatible(
                 "content": prompt
             }],
         }));
+    request = apply_configured_headers(request, model)?;
     request = request.header("x-api-key", &model.token);
 
     let response = request.send().await.context("failed to call local LLM")?;
@@ -756,6 +770,20 @@ fn completion_url(base_url: &str, endpoint: &str) -> String {
     } else {
         format!("{base_url}/{endpoint}")
     }
+}
+
+fn apply_configured_headers(
+    mut request: reqwest::RequestBuilder,
+    model: &ResolvedLocalLlm,
+) -> Result<reqwest::RequestBuilder> {
+    for (name, value) in &model.headers {
+        let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid configured header name: {name}"))?;
+        let header_value = reqwest::header::HeaderValue::from_str(value)
+            .with_context(|| format!("invalid configured header value for {name}"))?;
+        request = request.header(header_name, header_value);
+    }
+    Ok(request)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2391,6 +2419,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_llm_config_resolves_configured_headers() {
+        let config: LocalLlmConfig = toml::from_str(
+            r#"
+active_model = "qwen"
+
+[[providers]]
+name = "dashscope"
+api_base = "https://example.test/v1"
+api_key = "test-token"
+api_style = "openai"
+
+[providers.headers]
+X-Test-Header = " enabled "
+User-Agent = "OpenAI/Go 3.22.0"
+
+[[models]]
+name = "qwen"
+provider = "dashscope"
+"#,
+        )
+        .unwrap();
+
+        let model = config.active_model().unwrap();
+
+        assert!(model
+            .headers
+            .contains(&("X-Test-Header".to_string(), "enabled".to_string())));
+        assert!(model
+            .headers
+            .contains(&("User-Agent".to_string(), "OpenAI/Go 3.22.0".to_string())));
+    }
+
+    #[test]
     fn parses_openai_tool_calls_from_chat_completion() {
         let response = json!({
             "choices": [{
@@ -2818,6 +2879,7 @@ mod tests {
         fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
 
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let headers = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2825,11 +2887,14 @@ mod tests {
             "/chat/completions",
             post({
                 let bodies = bodies.clone();
+                let headers = headers.clone();
                 let calls = calls.clone();
-                move |Json(body): Json<Value>| {
+                move |request_headers: axum::http::HeaderMap, Json(body): Json<Value>| {
                     let bodies = bodies.clone();
+                    let headers = headers.clone();
                     let calls = calls.clone();
                     async move {
+                        headers.lock().unwrap().push(request_headers);
                         bodies.lock().unwrap().push(body);
                         match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                             0 => Json(json!({
@@ -2870,6 +2935,7 @@ mod tests {
             api_style: "openai".to_string(),
             token: "test-token".to_string(),
             token_configured: true,
+            headers: vec![("User-Agent".to_string(), "OpenAI/Go 3.22.0".to_string())],
         };
 
         let output = call_openai_compatible(
@@ -2885,6 +2951,13 @@ mod tests {
         assert_eq!(output.output, "notes.md says: local notes");
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2);
+        let headers = headers.lock().unwrap();
+        assert_eq!(headers.len(), 2);
+        assert!(headers.iter().all(|headers| {
+            headers
+                .get(header::USER_AGENT)
+                .is_some_and(|value| value == "OpenAI/Go 3.22.0")
+        }));
         assert!(bodies[0]["tools"]
             .as_array()
             .unwrap()
