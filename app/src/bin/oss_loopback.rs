@@ -194,6 +194,13 @@ impl LocalLlmConfig {
             token,
             token_configured: true,
             headers: provider.resolved_headers(),
+            description: model
+                .description
+                .as_deref()
+                .or(provider.description.as_deref())
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(ToOwned::to_owned),
         })
     }
 }
@@ -206,6 +213,7 @@ struct LocalLlmProviderConfig {
     api_key: Option<String>,
     token: Option<String>,
     api_style: Option<String>,
+    description: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
 }
@@ -245,6 +253,7 @@ struct LocalLlmConfigModel {
     alias: Option<String>,
     id: Option<String>,
     display_name: Option<String>,
+    description: Option<String>,
 }
 
 impl LocalLlmConfigModel {
@@ -279,6 +288,7 @@ struct ResolvedLocalLlm {
     token: String,
     token_configured: bool,
     headers: Vec<(String, String)>,
+    description: Option<String>,
 }
 
 impl ResolvedLocalLlm {
@@ -293,12 +303,20 @@ impl ResolvedLocalLlm {
     }
 
     fn description(&self) -> String {
-        let auth = if self.token_configured {
-            "token configured"
-        } else {
-            "no token configured"
-        };
-        format!("Local {} model ({auth})", self.api_style)
+        self.description
+            .clone()
+            .unwrap_or_else(|| format!("Local {}", self.api_style_label()))
+    }
+
+    fn api_style_label(&self) -> &str {
+        match self.api_style.trim().to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => "Anthropic",
+            "google" | "gemini" => "Google",
+            "openai" | "openai-compatible" | "openai_compatible" => "OpenAI",
+            "xai" | "grok" => "xAI",
+            "openrouter" => "OpenRouter",
+            _ => self.api_style.trim(),
+        }
     }
 }
 
@@ -1439,15 +1457,27 @@ fn local_tool_call_from_api(tool_call: &maa::message::ToolCall) -> Option<LocalT
             }),
         ),
         maa::message::tool_call::Tool::ApplyFileDiffs(diffs) => {
-            let diff = diffs.diffs.first()?;
-            (
-                "search_replace",
-                json!({
-                    "path": diff.file_path,
-                    "search": diff.search,
-                    "replace": diff.replace
-                }),
-            )
+            if let Some(diff) = diffs.diffs.first() {
+                (
+                    "search_replace",
+                    json!({
+                        "path": diff.file_path,
+                        "search": diff.search,
+                        "replace": diff.replace
+                    }),
+                )
+            } else if let Some(new_file) = diffs.new_files.first() {
+                (
+                    "write_file",
+                    json!({
+                        "path": new_file.file_path,
+                        "content": new_file.content,
+                        "overwrite": true
+                    }),
+                )
+            } else {
+                return None;
+            }
         }
         _ => return None,
     };
@@ -1463,12 +1493,12 @@ fn api_tool_result_text(result: &maa::message::ToolCallResult) -> String {
     match result.result.as_ref() {
         Some(maa::message::tool_call_result::Result::RunShellCommand(result)) => {
             match result.result.as_ref() {
-                Some(maa::run_shell_command_result::Result::CommandFinished(finished)) => {
-                    format!(
-                        "Command: {}\nExit code: {}\n\n{}",
-                        result.command, finished.exit_code, finished.output
-                    )
-                }
+                Some(maa::run_shell_command_result::Result::CommandFinished(finished)) => format!(
+                    "Command: {}\nExit code: {}\n\n{}",
+                    result.command,
+                    finished.exit_code,
+                    strip_local_command_header(&finished.output)
+                ),
                 _ => format!("Command result for {} is unavailable.", result.command),
             }
         }
@@ -1510,16 +1540,61 @@ fn api_tool_result_text(result: &maa::message::ToolCallResult) -> String {
         Some(maa::message::tool_call_result::Result::ApplyFileDiffs(result)) => {
             match result.result.as_ref() {
                 Some(maa::apply_file_diffs_result::Result::Success(success)) => {
-                    format!(
-                        "Applied file edits to {} file(s).",
-                        success.updated_files_v2.len() + success.deleted_files.len()
-                    )
+                    apply_file_diffs_result_text(success)
                 }
                 Some(maa::apply_file_diffs_result::Result::Error(error)) => error.message.clone(),
                 None => "File edit result is unavailable.".to_string(),
             }
         }
         _ => "Tool result is unavailable.".to_string(),
+    }
+}
+
+fn strip_local_command_header(output: &str) -> String {
+    let mut lines = output.lines();
+    if lines
+        .next()
+        .is_some_and(|line| line.starts_with("Command: "))
+        && lines
+            .next()
+            .is_some_and(|line| line.starts_with("Exit code: "))
+    {
+        let stripped = lines.collect::<Vec<_>>().join("\n");
+        stripped
+            .strip_prefix('\n')
+            .unwrap_or(&stripped)
+            .trim_end_matches('\n')
+            .to_string()
+    } else {
+        output.to_string()
+    }
+}
+
+fn apply_file_diffs_result_text(success: &maa::apply_file_diffs_result::Success) -> String {
+    let mut parts = Vec::new();
+
+    for updated in &success.updated_files_v2 {
+        if let Some(file) = updated.file.as_ref() {
+            parts.push(format!("{}:\n{}", file.file_path, file.content));
+        }
+    }
+    if !success.deleted_files.is_empty() {
+        let deleted = success
+            .deleted_files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("Deleted files: {deleted}"));
+    }
+
+    if parts.is_empty() {
+        format!(
+            "Applied file edits to {} file(s).",
+            success.updated_files_v2.len() + success.deleted_files.len()
+        )
+    } else {
+        parts.join("\n\n")
     }
 }
 
@@ -2499,12 +2574,16 @@ fn llm_info(model: &ResolvedLocalLlm) -> Value {
             "requestMultiplier": 0,
         },
         "description": model.description(),
-        "disableReason": null,
+        "disableReason": if model.token_configured {
+            Value::Null
+        } else {
+            json!("Configure an API token in llm.toml")
+        },
         "visionSupported": false,
         "spec": null,
         "provider": model.provider(),
         "hostConfigs": [{
-            "enabled": true,
+            "enabled": model.token_configured,
             "modelRoutingHost": "DIRECT_API",
         }],
         "pricing": {
@@ -2593,6 +2672,7 @@ name = "dashscope"
 api_base = "https://example.test/v1"
 api_key = "test-token"
 api_style = "openai"
+description = "DashScope local"
 
 [providers.headers]
 X-Test-Header = " enabled "
@@ -2601,12 +2681,16 @@ User-Agent = "OpenAI/Go 3.22.0"
 [[models]]
 name = "qwen"
 provider = "dashscope"
+display_name = "Qwen"
+description = "Qwen coding"
 "#,
         )
         .unwrap();
 
         let model = config.active_model().unwrap();
 
+        assert_eq!(model.display_name, "Qwen");
+        assert_eq!(model.description(), "Qwen coding");
         assert!(model
             .headers
             .contains(&("X-Test-Header".to_string(), "enabled".to_string())));
@@ -2726,6 +2810,184 @@ provider = "dashscope"
         assert_eq!(messages[2]["content"], "first answer");
         assert_eq!(messages[3]["role"], "user");
         assert_eq!(messages[3]["content"], "follow up");
+    }
+
+    #[test]
+    fn local_tool_call_from_api_reconstructs_write_file() {
+        let tool_call = maa::message::ToolCall {
+            tool_call_id: "call_write".to_string(),
+            tool: Some(maa::message::tool_call::Tool::ApplyFileDiffs(
+                maa::message::tool_call::ApplyFileDiffs {
+                    summary: "Write notes.md".to_string(),
+                    diffs: Vec::new(),
+                    new_files: vec![maa::message::tool_call::apply_file_diffs::NewFile {
+                        file_path: "notes.md".to_string(),
+                        content: "local notes".to_string(),
+                    }],
+                    deleted_files: Vec::new(),
+                    v4a_updates: Vec::new(),
+                },
+            )),
+        };
+
+        let local = local_tool_call_from_api(&tool_call).unwrap();
+
+        assert_eq!(local.id, "call_write");
+        assert_eq!(local.name, "write_file");
+        assert_eq!(local.arguments["path"], "notes.md");
+        assert_eq!(local.arguments["content"], "local notes");
+        assert_eq!(local.arguments["overwrite"], true);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn openai_messages_include_prior_write_file_tool_history() {
+        let request = maa::Request {
+            task_context: Some(maa::request::TaskContext {
+                tasks: vec![maa::Task {
+                    id: "task-1".to_string(),
+                    description: "task".to_string(),
+                    dependencies: None,
+                    messages: vec![
+                        maa::Message {
+                            id: "m1".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r1".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::ToolCall(
+                                maa::message::ToolCall {
+                                    tool_call_id: "call_write".to_string(),
+                                    tool: Some(maa::message::tool_call::Tool::ApplyFileDiffs(
+                                        maa::message::tool_call::ApplyFileDiffs {
+                                            summary: "Write notes.md".to_string(),
+                                            diffs: Vec::new(),
+                                            new_files: vec![
+                                                maa::message::tool_call::apply_file_diffs::NewFile {
+                                                    file_path: "notes.md".to_string(),
+                                                    content: "local notes".to_string(),
+                                                },
+                                            ],
+                                            deleted_files: Vec::new(),
+                                            v4a_updates: Vec::new(),
+                                        },
+                                    )),
+                                },
+                            )),
+                        },
+                        maa::Message {
+                            id: "m2".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r1".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::ToolCallResult(
+                                maa::message::ToolCallResult {
+                                    tool_call_id: "call_write".to_string(),
+                                    context: None,
+                                    result: Some(
+                                        maa::message::tool_call_result::Result::ApplyFileDiffs(
+                                            maa::ApplyFileDiffsResult {
+                                                result: Some(
+                                                    maa::apply_file_diffs_result::Result::Success(
+                                                        maa::apply_file_diffs_result::Success {
+                                                            updated_files: Vec::new(),
+                                                            updated_files_v2: vec![
+                                                                maa::apply_file_diffs_result::success::UpdatedFileContent {
+                                                                    file: Some(maa::FileContent {
+                                                                        file_path: "notes.md".to_string(),
+                                                                        content: "local notes".to_string(),
+                                                                        line_range: None,
+                                                                    }),
+                                                                    was_edited_by_user: false,
+                                                                },
+                                                            ],
+                                                            deleted_files: Vec::new(),
+                                                        },
+                                                    ),
+                                                ),
+                                            },
+                                        ),
+                                    ),
+                                },
+                            )),
+                        },
+                    ],
+                    summary: String::new(),
+                    server_data: String::new(),
+                }],
+            }),
+            input: Some(maa::request::Input {
+                context: None,
+                r#type: Some(maa::request::input::Type::UserInputs(
+                    maa::request::input::UserInputs {
+                        inputs: vec![maa::request::input::user_inputs::UserInput {
+                            input: Some(
+                                maa::request::input::user_inputs::user_input::Input::UserQuery(
+                                    maa::request::input::UserQuery {
+                                        query: "continue".to_string(),
+                                        referenced_attachments: HashMap::new(),
+                                        mode: None,
+                                        intended_agent: Default::default(),
+                                    },
+                                ),
+                            ),
+                        }],
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let messages = openai_messages_for_request(&request);
+
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "write_file"
+        );
+        let arguments: Value = serde_json::from_str(
+            messages[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arguments["path"], "notes.md");
+        assert_eq!(arguments["content"], "local notes");
+        assert_eq!(arguments["overwrite"], true);
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_write");
+        assert_eq!(messages[2]["content"], "notes.md:\nlocal notes");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "continue");
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn api_tool_result_text_strips_local_command_header() {
+        let result = maa::message::ToolCallResult {
+            tool_call_id: "call_bash".to_string(),
+            context: None,
+            result: Some(maa::message::tool_call_result::Result::RunShellCommand(
+                maa::RunShellCommandResult {
+                    command: "printf hi".to_string(),
+                    output: String::new(),
+                    exit_code: 0,
+                    result: Some(maa::run_shell_command_result::Result::CommandFinished(
+                        maa::ShellCommandFinished {
+                            command_id: "call_bash".to_string(),
+                            output: "Command: printf hi\nExit code: 0\n\nStdout:\nhi\n".to_string(),
+                            exit_code: 0,
+                        },
+                    )),
+                },
+            )),
+        };
+
+        let text = api_tool_result_text(&result);
+
+        assert_eq!(text, "Command: printf hi\nExit code: 0\n\nStdout:\nhi");
     }
 
     #[test]
@@ -3172,6 +3434,7 @@ provider = "dashscope"
             token: "test-token".to_string(),
             token_configured: true,
             headers: vec![("User-Agent".to_string(), "OpenAI/Go 3.22.0".to_string())],
+            description: None,
         };
 
         let output = call_openai_compatible(
