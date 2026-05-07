@@ -205,6 +205,21 @@ impl LocalLlmConfig {
             token,
             token_configured: true,
             headers: provider.resolved_headers(),
+            reasoning_field_name: provider
+                .reasoning_field_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .unwrap_or("reasoning_content")
+                .to_owned(),
+            thinking: model
+                .thinking
+                .as_deref()
+                .map(str::trim)
+                .filter(|thinking| !thinking.is_empty())
+                .unwrap_or("off")
+                .to_owned(),
+            thinking_budget: model.thinking_budget,
             description: model
                 .description
                 .as_deref()
@@ -224,6 +239,7 @@ struct LocalLlmProviderConfig {
     api_key: Option<String>,
     token: Option<String>,
     api_style: Option<String>,
+    reasoning_field_name: Option<String>,
     description: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
@@ -265,6 +281,8 @@ struct LocalLlmConfigModel {
     id: Option<String>,
     display_name: Option<String>,
     description: Option<String>,
+    thinking: Option<String>,
+    thinking_budget: Option<u32>,
 }
 
 impl LocalLlmConfigModel {
@@ -299,6 +317,9 @@ struct ResolvedLocalLlm {
     token: String,
     token_configured: bool,
     headers: Vec<(String, String)>,
+    reasoning_field_name: String,
+    thinking: String,
+    thinking_budget: Option<u32>,
     description: Option<String>,
 }
 
@@ -610,6 +631,7 @@ where
     run_openai_agent_loop_with_progress(
         messages,
         workspace,
+        &model.reasoning_field_name,
         |messages| call_openai_chat_completion(client, model, messages),
         on_tool_call,
         on_tool_result,
@@ -623,10 +645,9 @@ async fn call_openai_chat_completion(
     messages: Vec<Value>,
 ) -> Result<Value> {
     let url = completion_url(&model.base_url, "chat/completions");
-    let mut request = client.post(url).json(&openai_chat_completion_payload(
-        &model.base_model_name,
-        messages,
-    ));
+    let mut request = client
+        .post(url)
+        .json(&openai_chat_completion_payload(model, messages));
     request = apply_configured_headers(request, model)?;
     request = request.bearer_auth(&model.token);
 
@@ -643,14 +664,40 @@ async fn call_openai_chat_completion(
     serde_json::from_str(&body).context("failed to parse local LLM response")
 }
 
-fn openai_chat_completion_payload(model_name: &str, messages: Vec<Value>) -> Value {
-    json!({
-        "model": model_name,
+fn openai_chat_completion_payload(model: &ResolvedLocalLlm, messages: Vec<Value>) -> Value {
+    let mut payload = json!({
+        "model": model.base_model_name,
         "messages": messages,
         "tools": local_openai_tools(),
         "tool_choice": "auto",
         "stream": false,
-    })
+    });
+
+    if thinking_enabled(&model.thinking) {
+        if model.api_style.trim().eq_ignore_ascii_case("reasoning") {
+            payload["reasoning_effort"] = json!(reasoning_effort(&model.thinking));
+        } else {
+            payload["enable_thinking"] = json!(true);
+            if let Some(budget) = model.thinking_budget {
+                payload["thinking_budget"] = json!(budget);
+            }
+        }
+    }
+
+    payload
+}
+
+fn thinking_enabled(thinking: &str) -> bool {
+    !thinking.trim().is_empty() && !thinking.trim().eq_ignore_ascii_case("off")
+}
+
+fn reasoning_effort(thinking: &str) -> &str {
+    match thinking.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "medium" => "medium",
+        "max" => "high",
+        _ => "high",
+    }
 }
 
 fn local_openai_tools() -> Vec<Value> {
@@ -848,6 +895,7 @@ fn apply_configured_headers(
 #[derive(Clone, Debug, PartialEq)]
 struct LocalAssistantTurn {
     content: String,
+    reasoning: String,
     tool_calls: Vec<LocalToolCall>,
 }
 
@@ -874,6 +922,7 @@ struct LocalToolEvent {
 #[derive(Clone, Debug, PartialEq)]
 struct LocalAgentRun {
     output: String,
+    reasoning: String,
     tool_calls: Vec<LocalToolCall>,
     tool_events: Vec<LocalToolEvent>,
 }
@@ -882,6 +931,7 @@ impl LocalAgentRun {
     fn from_output(output: String) -> Self {
         Self {
             output,
+            reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_events: Vec::new(),
         }
@@ -1296,7 +1346,10 @@ fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> 
     Ok(workspace.join(requested))
 }
 
-fn parse_openai_assistant_turn(value: &Value) -> Result<LocalAssistantTurn> {
+fn parse_openai_assistant_turn(
+    value: &Value,
+    reasoning_field_name: &str,
+) -> Result<LocalAssistantTurn> {
     let message = value
         .pointer("/choices/0/message")
         .or_else(|| value.pointer("/message"))
@@ -1305,6 +1358,7 @@ fn parse_openai_assistant_turn(value: &Value) -> Result<LocalAssistantTurn> {
         .get("content")
         .and_then(text_value)
         .unwrap_or_default();
+    let reasoning = reasoning_text(message, reasoning_field_name).unwrap_or_default();
     let tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -1320,6 +1374,7 @@ fn parse_openai_assistant_turn(value: &Value) -> Result<LocalAssistantTurn> {
 
     Ok(LocalAssistantTurn {
         content,
+        reasoning,
         tool_calls,
     })
 }
@@ -1379,6 +1434,54 @@ fn text_value(value: &Value) -> Option<String> {
     }
 }
 
+fn reasoning_text(message: &Value, field_name: &str) -> Option<String> {
+    let primary = field_name.trim();
+    let candidates = if primary.is_empty() || primary == "reasoning_content" {
+        vec!["reasoning_content", "reasoning"]
+    } else {
+        vec![primary, "reasoning_content", "reasoning"]
+    };
+
+    for candidate in candidates {
+        if let Some(text) = message
+            .get(candidate)
+            .and_then(text_value)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text);
+        }
+    }
+
+    message.get("content").and_then(thinking_blocks_text)
+}
+
+fn thinking_blocks_text(value: &Value) -> Option<String> {
+    let Value::Array(blocks) = value else {
+        return None;
+    };
+
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+        .flat_map(|block| match block.get("thinking") {
+            Some(Value::Array(inner)) => inner
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>(),
+            Some(Value::String(text)) => vec![text.as_str()],
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
     let mut messages = vec![openai_system_message()];
     let mut local_tool_call_ids = std::collections::HashSet::new();
@@ -1403,6 +1506,7 @@ fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
                             local_tool_call_ids.insert(local_tool_call.id.clone());
                             messages.push(openai_assistant_message(&LocalAssistantTurn {
                                 content: String::new(),
+                                reasoning: String::new(),
                                 tool_calls: vec![local_tool_call],
                             }));
                         }
@@ -1736,12 +1840,21 @@ where
     F: FnMut(Vec<Value>) -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
-    run_openai_agent_loop_with_progress(messages, workspace, complete, |_| {}, |_| {}).await
+    run_openai_agent_loop_with_progress(
+        messages,
+        workspace,
+        "reasoning_content",
+        complete,
+        |_| {},
+        |_| {},
+    )
+    .await
 }
 
 async fn run_openai_agent_loop_with_progress<F, Fut, OnToolCall, OnToolResult>(
     messages: Vec<Value>,
     _workspace: &Path,
+    reasoning_field_name: &str,
     mut complete: F,
     mut on_tool_call: OnToolCall,
     _on_tool_result: OnToolResult,
@@ -1753,13 +1866,14 @@ where
     OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
     let response = complete(messages).await?;
-    let turn = parse_openai_assistant_turn(&response)?;
+    let turn = parse_openai_assistant_turn(&response, reasoning_field_name)?;
     for tool_call in &turn.tool_calls {
         on_tool_call(tool_call);
     }
 
     Ok(LocalAgentRun {
         output: turn.content,
+        reasoning: turn.reasoning,
         tool_calls: turn.tool_calls,
         tool_events: Vec::new(),
     })
@@ -1809,6 +1923,17 @@ fn agent_output_message(output: &str, task_id: &str, request_id: &str) -> maa::M
         request_id,
         maa::message::Message::AgentOutput(maa::message::AgentOutput {
             text: output.to_string(),
+        }),
+    )
+}
+
+fn agent_reasoning_message(reasoning: &str, task_id: &str, request_id: &str) -> maa::Message {
+    local_message(
+        task_id,
+        request_id,
+        maa::message::Message::AgentReasoning(maa::message::AgentReasoning {
+            reasoning: reasoning.to_string(),
+            finished_duration: None,
         }),
     )
 }
@@ -2208,18 +2333,23 @@ fn multi_agent_response_event_stream(state: ServerState, request: maa::Request) 
             Err(err) => local_agent_error_run(err),
         };
 
+        let mut final_messages = Vec::new();
+        if !run.reasoning.trim().is_empty() {
+            final_messages.push(agent_reasoning_message(
+                &run.reasoning,
+                &task_info.id,
+                &stream_ids.request_id,
+            ));
+        }
         if !run.output.trim().is_empty() {
-            send_response_event(
-                &tx,
-                add_messages_event(
-                    &task_info.id,
-                    vec![agent_output_message(
-                        &run.output,
-                        &task_info.id,
-                        &stream_ids.request_id,
-                    )],
-                ),
-            );
+            final_messages.push(agent_output_message(
+                &run.output,
+                &task_info.id,
+                &stream_ids.request_id,
+            ));
+        }
+        if !final_messages.is_empty() {
+            send_response_event(&tx, add_messages_event(&task_info.id, final_messages));
         }
         send_response_event(&tx, finished_event());
     });
@@ -2232,6 +2362,13 @@ fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa:
     let stream_ids = stream_ids(request);
     let task_info = task_info(request);
     let mut messages = Vec::new();
+    if !run.reasoning.trim().is_empty() {
+        messages.push(agent_reasoning_message(
+            &run.reasoning,
+            &task_info.id,
+            &stream_ids.request_id,
+        ));
+    }
     for tool_call in &run.tool_calls {
         messages.push(local_tool_call_message(
             tool_call,
@@ -2687,7 +2824,11 @@ fn llm_info(model: &ResolvedLocalLlm) -> Value {
         "displayName": model.display_name,
         "baseModelName": model.base_model_name,
         "id": model.id,
-        "reasoningLevel": null,
+        "reasoningLevel": if thinking_enabled(&model.thinking) {
+            json!(model.thinking)
+        } else {
+            Value::Null
+        },
         "usageMetadata": {
             "creditMultiplier": null,
             "requestMultiplier": 0,
@@ -2780,6 +2921,23 @@ fn sanitize_identifier(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_openai_model(name: &str) -> ResolvedLocalLlm {
+        ResolvedLocalLlm {
+            id: name.to_string(),
+            display_name: name.to_string(),
+            base_model_name: name.to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_style: "openai".to_string(),
+            token: "test-token".to_string(),
+            token_configured: true,
+            headers: Vec::new(),
+            reasoning_field_name: "reasoning_content".to_string(),
+            thinking: "off".to_string(),
+            thinking_budget: None,
+            description: None,
+        }
+    }
+
     #[test]
     fn local_llm_config_resolves_configured_headers() {
         let config: LocalLlmConfig = toml::from_str(
@@ -2802,6 +2960,8 @@ name = "qwen"
 provider = "dashscope"
 display_name = "Qwen"
 description = "Qwen coding"
+thinking = "high"
+thinking_budget = 2048
 "#,
         )
         .unwrap();
@@ -2810,6 +2970,8 @@ description = "Qwen coding"
 
         assert_eq!(model.display_name, "Qwen");
         assert_eq!(model.description(), "Qwen coding");
+        assert_eq!(model.thinking, "high");
+        assert_eq!(model.thinking_budget, Some(2048));
         assert!(model
             .headers
             .contains(&("X-Test-Header".to_string(), "enabled".to_string())));
@@ -2836,13 +2998,55 @@ description = "Qwen coding"
             }]
         });
 
-        let turn = parse_openai_assistant_turn(&response).unwrap();
+        let turn = parse_openai_assistant_turn(&response, "reasoning_content").unwrap();
 
         assert_eq!(turn.content, "I'll inspect that file.");
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert_eq!(turn.tool_calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn parses_openai_reasoning_content() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "I need to inspect the file.",
+                    "content": "I'll inspect that file."
+                }
+            }]
+        });
+
+        let turn = parse_openai_assistant_turn(&response, "reasoning_content").unwrap();
+
+        assert_eq!(turn.reasoning, "I need to inspect the file.");
+        assert_eq!(turn.content, "I'll inspect that file.");
+    }
+
+    #[test]
+    fn parses_openai_thinking_content_blocks() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": [
+                                { "type": "text", "text": "Step 1. " },
+                                { "type": "text", "text": "Step 2." }
+                            ]
+                        },
+                        { "type": "text", "text": "Done." }
+                    ]
+                }
+            }]
+        });
+
+        let turn = parse_openai_assistant_turn(&response, "reasoning_content").unwrap();
+
+        assert_eq!(turn.reasoning, "Step 1. Step 2.");
+        assert_eq!(turn.content, "Done.");
     }
 
     #[test]
@@ -3446,6 +3650,7 @@ description = "Qwen coding"
         let output = run_openai_agent_loop_with_progress(
             openai_messages_from_prompt("What is in notes.md?"),
             tempdir.path(),
+            "reasoning_content",
             {
                 let calls = calls.clone();
                 move |_messages: Vec<Value>| {
@@ -3504,7 +3709,7 @@ description = "Qwen coding"
     #[test]
     fn openai_payload_advertises_read_file_tool() {
         let payload = openai_chat_completion_payload(
-            "qwen3.6-plus",
+            &test_openai_model("qwen3.6-plus"),
             vec![json!({
                 "role": "user",
                 "content": "read notes.md"
@@ -3541,6 +3746,43 @@ description = "Qwen coding"
                 && tool["function"]["name"] == "bash"
                 && tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
         }));
+    }
+
+    #[test]
+    fn openai_payload_enables_dashscope_thinking_from_model_config() {
+        let mut model = test_openai_model("qwen3.6-plus");
+        model.thinking = "high".to_string();
+        model.thinking_budget = Some(2048);
+
+        let payload = openai_chat_completion_payload(
+            &model,
+            vec![json!({
+                "role": "user",
+                "content": "think"
+            })],
+        );
+
+        assert_eq!(payload["enable_thinking"], true);
+        assert_eq!(payload["thinking_budget"], 2048);
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_payload_sets_reasoning_effort_for_reasoning_api_style() {
+        let mut model = test_openai_model("reasoning-model");
+        model.api_style = "reasoning".to_string();
+        model.thinking = "medium".to_string();
+
+        let payload = openai_chat_completion_payload(
+            &model,
+            vec![json!({
+                "role": "user",
+                "content": "think"
+            })],
+        );
+
+        assert_eq!(payload["reasoning_effort"], "medium");
+        assert!(payload.get("enable_thinking").is_none());
     }
 
     #[test]
@@ -3623,6 +3865,9 @@ description = "Qwen coding"
             token: "test-token".to_string(),
             token_configured: true,
             headers: vec![("User-Agent".to_string(), "OpenAI/Go 3.22.0".to_string())],
+            reasoning_field_name: "reasoning_content".to_string(),
+            thinking: "off".to_string(),
+            thinking_budget: None,
             description: None,
         };
 
@@ -3663,6 +3908,7 @@ description = "Qwen coding"
         let request = maa::Request::default();
         let run = LocalAgentRun {
             output: "done".to_string(),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_events: vec![LocalToolEvent {
                 tool_call: LocalToolCall {
@@ -3703,6 +3949,41 @@ description = "Qwen coding"
         ));
         assert!(matches!(
             messages[2].message,
+            Some(maa::message::Message::AgentOutput(_))
+        ));
+    }
+
+    #[test]
+    fn agent_response_events_include_reasoning_message() {
+        let request = maa::Request::default();
+        let run = LocalAgentRun {
+            output: "done".to_string(),
+            reasoning: "I should inspect the workspace first.".to_string(),
+            tool_calls: Vec::new(),
+            tool_events: Vec::new(),
+        };
+
+        let events = agent_response_events(&request, run);
+        let messages = events
+            .iter()
+            .filter_map(|event| match event.r#type.as_ref()? {
+                maa::response_event::Type::ClientActions(actions) => Some(actions),
+                _ => None,
+            })
+            .flat_map(|actions| actions.actions.iter())
+            .filter_map(|action| match action.action.as_ref()? {
+                maa::client_action::Action::AddMessagesToTask(add) => Some(add.messages.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            messages[0].message,
+            Some(maa::message::Message::AgentReasoning(_))
+        ));
+        assert!(matches!(
+            messages[1].message,
             Some(maa::message::Message::AgentOutput(_))
         ));
     }
