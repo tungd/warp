@@ -13,6 +13,9 @@ LEGACY_APP_NAMES := WarpOSS WarpOss
 
 CARGO_PROFILE ?= dev
 PROFILE_DIR := $(if $(filter dev,$(CARGO_PROFILE)),debug,$(if $(filter release,$(CARGO_PROFILE)),release,$(CARGO_PROFILE)))
+CARGO_FEATURES ?=
+BUNDLE_FEATURES ?= release_bundle
+CARGO_FEATURE_ARGS = $(if $(strip $(CARGO_FEATURES)),--features '$(CARGO_FEATURES)',)
 BIN_PATH := target/$(PROFILE_DIR)/$(BIN_NAME)
 UNIVERSAL_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
 UNIVERSAL_DIR := target/universal/$(PROFILE_DIR)
@@ -58,6 +61,8 @@ help:
 		'Useful overrides:' \
 		'  CARGO=cargo|/path/to/cargo' \
 		'  CARGO_PROFILE=dev|release|release-lto|...' \
+		'  CARGO_FEATURES="<features>"' \
+		'  BUNDLE_FEATURES=release_bundle|"<features>"' \
 		'  CODESIGN_IDENTITY=auto|"-"|"<identity>"' \
 		'  INSTALL_DIR=/Applications' \
 		'  OPEN_AFTER_INSTALL=1'
@@ -71,16 +76,18 @@ print-config:
 	@printf 'INSTALLED_APP=%s\n' '$(INSTALLED_APP)'
 	@printf 'ICON_SOURCE=%s\n' '$(ICON_SOURCE)'
 	@printf 'CARGO_PROFILE=%s\n' '$(CARGO_PROFILE)'
+	@printf 'CARGO_FEATURES=%s\n' '$(CARGO_FEATURES)'
+	@printf 'BUNDLE_FEATURES=%s\n' '$(BUNDLE_FEATURES)'
 	@printf 'CODESIGN_IDENTITY=%s\n' '$(CODESIGN_IDENTITY)'
 
 build:
-	$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)'
+	$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)' $(CARGO_FEATURE_ARGS)
 
 build-universal:
 	$(RUSTUP) target add $(UNIVERSAL_TARGETS)
 	@for target in $(UNIVERSAL_TARGETS); do \
 		echo "Building $(BIN_NAME) for $$target"; \
-		$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)' --target "$$target"; \
+		$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)' $(CARGO_FEATURE_ARGS) --target "$$target"; \
 	done
 	mkdir -p '$(UNIVERSAL_DIR)'
 	lipo -create $(foreach target,$(UNIVERSAL_TARGETS),'target/$(target)/$(PROFILE_DIR)/$(BIN_NAME)') -output '$(UNIVERSAL_BIN_PATH)'
@@ -88,11 +95,18 @@ build-universal:
 
 bundle: sign
 
+bundle: CARGO_FEATURES := $(BUNDLE_FEATURES)
+
 bundle-universal: sign-universal
+
+bundle-universal: CARGO_FEATURES := $(BUNDLE_FEATURES)
 
 sign: build prepare-bundle
 
+sign: CARGO_FEATURES := $(BUNDLE_FEATURES)
+
 sign-universal: BUNDLE_BIN_PATH := $(UNIVERSAL_BIN_PATH)
+sign-universal: CARGO_FEATURES := $(BUNDLE_FEATURES)
 sign-universal: build-universal prepare-bundle
 
 prepare-bundle:
@@ -170,8 +184,10 @@ prepare-bundle:
 	echo "Codesigning $(APP_PATH) with $$identity"; \
 	codesign --force --deep --options runtime --sign "$$identity" '$(APP_PATH)' --entitlements '$(ENTITLEMENTS)'
 
+install: CARGO_FEATURES := $(BUNDLE_FEATURES)
 install: bundle install-bundle
 
+install-universal: CARGO_FEATURES := $(BUNDLE_FEATURES)
 install-universal: bundle-universal install-bundle
 
 install-bundle:
