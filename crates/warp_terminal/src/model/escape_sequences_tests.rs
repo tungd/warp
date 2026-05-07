@@ -489,6 +489,44 @@ fn test_unmatched_keystroke_does_not_yield_escape_sequence() {
     }
 }
 
+#[test]
+fn test_command_modified_keystrokes_use_meta_without_keyboard_protocol() {
+    let terminal_model_mock = TerminalModelMock::new();
+
+    let cmd_j = Keystroke::parse("cmd-j").unwrap();
+    assert_eq!(
+        KeystrokeWithDetails {
+            keystroke: &cmd_j,
+            key_without_modifiers: None,
+            chars: Some("j"),
+        }
+        .to_escape_sequence(&terminal_model_mock),
+        Some(b"\x1bj".to_vec())
+    );
+
+    let cmd_ctrl_j = Keystroke::parse("cmd-ctrl-j").unwrap();
+    assert_eq!(
+        KeystrokeWithDetails {
+            keystroke: &cmd_ctrl_j,
+            key_without_modifiers: None,
+            chars: Some("\n"),
+        }
+        .to_escape_sequence(&terminal_model_mock),
+        Some(b"\x1b\n".to_vec())
+    );
+
+    let ctrl_j = Keystroke::parse("ctrl-j").unwrap();
+    assert_eq!(
+        KeystrokeWithDetails {
+            keystroke: &ctrl_j,
+            key_without_modifiers: None,
+            chars: Some("\n"),
+        }
+        .to_escape_sequence(&terminal_model_mock),
+        None
+    );
+}
+
 struct TerminalModelMock {
     term_mode: TermMode,
 }
@@ -701,6 +739,20 @@ fn test_keyboard_enhancement_disambiguate_only() {
         .to_escape_sequence(&terminal_model_mock),
         Some(b"\x1b[97;5u".to_vec())
     );
+
+    // Cmd maps to Kitty's Super modifier when the application has enabled
+    // keyboard enhancement.
+    let cmd_j = Keystroke::parse("cmd-j").unwrap();
+    assert_eq!(
+        KeystrokeWithDetails {
+            keystroke: &cmd_j,
+            key_without_modifiers: None,
+            chars: Some("j"),
+        }
+        .to_escape_sequence(&terminal_model_mock),
+        Some(b"\x1b[106;9u".to_vec())
+    );
+
     // Plain Enter without modifiers - NOT ambiguous, should not use CSI u.
     let enter = Keystroke::parse("enter").unwrap();
     assert_eq!(

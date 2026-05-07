@@ -245,7 +245,8 @@ impl<T: ModeProvider> ToEscapeSequence<T> for KeystrokeWithDetails<'_> {
         // NOTE: Order matters! We assume all fn keystrokes have been handled by the
         // time we reach meta_keystroke_to_escape_sequence.
         let keystroke = self.keystroke;
-        fn_keystroke_to_escape_sequence(keystroke, mode_provider)
+        command_keystroke_to_meta_escape_sequence(keystroke, self.chars, mode_provider)
+            .or_else(|| fn_keystroke_to_escape_sequence(keystroke, mode_provider))
             .or_else(|| keystroke_to_c0_control_code(keystroke, mode_provider))
             .or_else(|| cursor_movement_keystroke_to_escape_sequence(keystroke, mode_provider))
             .or_else(|| meta_keystroke_to_escape_sequence(keystroke, mode_provider))
@@ -487,7 +488,8 @@ fn keystroke_to_c0_control_code(
 
     // Only emit C0 codes on ctrl-modified keystrokes, without other modifiers, per the VT-220
     // spec.
-    if !(keystroke.ctrl && !keystroke.alt && !keystroke.shift && !keystroke.meta) {
+    if !(keystroke.ctrl && !keystroke.alt && !keystroke.shift && !keystroke.meta && !keystroke.cmd)
+    {
         // Return None if the keystroke is not ctrl-key.
         return None;
     }
@@ -542,6 +544,46 @@ fn cursor_movement_keystroke_to_escape_sequence(
             .concat(),
         ),
     }
+}
+
+/// Treat unhandled Command chords as terminal Meta when the running program has
+/// not enabled the Kitty keyboard protocol. This matches native macOS Emacs
+/// setups that map Command to Meta, while still allowing Kitty-aware programs to
+/// receive Command as Super via CSI u.
+fn command_keystroke_to_meta_escape_sequence(
+    keystroke: &Keystroke,
+    chars: Option<&str>,
+    mode_provider: &impl ModeProvider,
+) -> Option<Vec<u8>> {
+    if !keystroke.cmd || mode_provider.is_term_mode_set(TermMode::KEYBOARD_PROTOCOL) {
+        return None;
+    }
+
+    let keystroke_without_cmd = Keystroke {
+        cmd: false,
+        ..keystroke.clone()
+    };
+
+    let bytes = fn_keystroke_to_escape_sequence(&keystroke_without_cmd, mode_provider)
+        .or_else(|| keystroke_to_c0_control_code(&keystroke_without_cmd, mode_provider))
+        .or_else(|| {
+            cursor_movement_keystroke_to_escape_sequence(&keystroke_without_cmd, mode_provider)
+        })
+        .or_else(|| meta_keystroke_to_escape_sequence(&keystroke_without_cmd, mode_provider))
+        .or_else(|| {
+            chars
+                .filter(|chars| !chars.is_empty())
+                .map(|chars| chars.as_bytes().to_vec())
+        })
+        .or_else(|| {
+            if keystroke_without_cmd.key.chars().count() == 1 {
+                Some(keystroke_without_cmd.key.as_bytes().to_vec())
+            } else {
+                map_special_key_to_bytes(&keystroke_without_cmd.key).map(|bytes| bytes.to_vec())
+            }
+        })?;
+
+    Some([&[C0::ESC], bytes.as_slice()].concat())
 }
 
 /// Returns the byte array corresponding to a special key, if a special key is provided.

@@ -31,7 +31,8 @@ pub(super) fn maybe_convert_keystroke_to_csi_u(
     // (e.g., Option+a → å) via the IME rather than acting as a modifier.
     //
     // See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate
-    let mut is_ambiguous = keystroke.key == "escape" || keystroke.ctrl || keystroke.meta;
+    let mut is_ambiguous =
+        keystroke.key == "escape" || keystroke.ctrl || keystroke.meta || keystroke.cmd;
     if !OperatingSystem::get().is_mac() {
         is_ambiguous = is_ambiguous || keystroke.alt;
     }
