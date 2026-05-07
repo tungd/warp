@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     future::Future,
     net::SocketAddr,
@@ -81,6 +81,8 @@ const TOKEN_TTL_SECONDS: &str = "3600";
 #[derive(Clone, Debug, Default, Deserialize)]
 struct LocalLlmConfig {
     active_model: String,
+    #[serde(default)]
+    agent: LocalLlmAgentConfig,
     #[serde(default)]
     providers: Vec<LocalLlmProviderConfig>,
     #[serde(default)]
@@ -191,7 +193,47 @@ impl LocalLlmConfig {
                 .map(str::trim)
                 .filter(|description| !description.is_empty())
                 .map(ToOwned::to_owned),
+            system_prompt: self.agent.resolve_system_prompt()?,
+            enabled_tools: self.agent.enabled_tools_set(),
         })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LocalLlmAgentConfig {
+    system_prompt: Option<String>,
+    system_prompt_file: Option<String>,
+    #[serde(default)]
+    enabled_tools: Vec<String>,
+}
+
+impl LocalLlmAgentConfig {
+    fn resolve_system_prompt(&self) -> Result<Option<String>> {
+        if let Some(path) = self
+            .system_prompt_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            Ok(Some(resolve_agent_system_prompt(path)?))
+        } else {
+            Ok(self.system_prompt.clone())
+        }
+    }
+
+    fn enabled_tools_set(&self) -> Option<HashSet<String>> {
+        if self.enabled_tools.is_empty() {
+            return None;
+        }
+
+        Some(
+            self.enabled_tools
+                .iter()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
     }
 }
 
@@ -285,6 +327,8 @@ struct ResolvedLocalLlm {
     thinking: String,
     thinking_budget: Option<u32>,
     description: Option<String>,
+    system_prompt: Option<String>,
+    enabled_tools: Option<HashSet<String>>,
 }
 
 impl ResolvedLocalLlm {
@@ -313,6 +357,14 @@ impl ResolvedLocalLlm {
             "openrouter" => "OpenRouter",
             _ => self.api_style.trim(),
         }
+    }
+
+    fn enabled_tools(&self) -> Option<&HashSet<String>> {
+        self.enabled_tools.as_ref()
+    }
+
+    fn configured_system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref().filter(|prompt| !prompt.trim().is_empty())
     }
 }
 
@@ -1499,7 +1551,7 @@ where
         "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
         | "gemini" | "openrouter" => {
             let workspace = workspace_for_request(request);
-            let messages = openai_messages_for_request(request);
+            let messages = openai_messages_for_request(request, &model);
             call_openai_compatible_with_progress(
                 &state.client,
                 &model,
@@ -1512,7 +1564,7 @@ where
         }
         _ => {
             let workspace = workspace_for_request(request);
-            let messages = openai_messages_for_request(request);
+            let messages = openai_messages_for_request(request, &model);
             call_openai_compatible_with_progress(
                 &state.client,
                 &model,
@@ -1548,7 +1600,7 @@ where
             call_openai_compatible_autonomous_with_progress(
                 &state.client,
                 &model,
-                openai_messages_from_prompt(prompt),
+                openai_messages_from_prompt(prompt, &model),
                 workspace,
                 &mut on_tool_call,
                 &mut on_tool_result,
@@ -1559,7 +1611,7 @@ where
             call_openai_compatible_autonomous_with_progress(
                 &state.client,
                 &model,
-                openai_messages_from_prompt(prompt),
+                openai_messages_from_prompt(prompt, &model),
                 workspace,
                 &mut on_tool_call,
                 &mut on_tool_result,
@@ -1700,7 +1752,7 @@ fn openai_chat_completion_payload(model: &ResolvedLocalLlm, messages: Vec<Value>
     let mut payload = json!({
         "model": model.base_model_name,
         "messages": messages,
-        "tools": local_openai_tools(),
+        "tools": local_openai_tools(model),
         "tool_choice": "auto",
         "stream": false,
     });
@@ -1732,135 +1784,67 @@ fn reasoning_effort(thinking: &str) -> &str {
     }
 }
 
-fn local_openai_tools() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a UTF-8 text file from the current workspace. The path must be relative to the workspace.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Workspace-relative file path to read"
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "description": "Zero-based line offset to start reading from"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of lines to read"
-                        }
-                    },
-                    "required": ["path"],
-                    "additionalProperties": false
+#[derive(Clone, Copy)]
+struct LocalToolDescriptor {
+    name: &'static str,
+    description: &'static str,
+    parameters: fn() -> Value,
+    execute: fn(&LocalToolCall, &Path) -> Result<LocalToolResult>,
+}
+
+const LOCAL_TOOL_REGISTRY: &[LocalToolDescriptor] = &[
+    LocalToolDescriptor {
+        name: "read_file",
+        description: "Read a UTF-8 text file from the current workspace. The path must be relative to the workspace.",
+        parameters: local_tool_read_file_parameters,
+        execute: execute_read_file_tool,
+    },
+    LocalToolDescriptor {
+        name: "write_file",
+        description: "Create or overwrite a UTF-8 text file in the current workspace. The path must be relative to the workspace. Existing files require overwrite=true.",
+        parameters: local_tool_write_file_parameters,
+        execute: execute_write_file_tool,
+    },
+    LocalToolDescriptor {
+        name: "search_replace",
+        description: "Make a targeted edit in an existing UTF-8 file by replacing an exact text block. The search text must match exactly once.",
+        parameters: local_tool_search_replace_parameters,
+        execute: execute_search_replace_tool,
+    },
+    LocalToolDescriptor {
+        name: "grep",
+        description: "Search workspace files for a Rust-regex pattern. The path must be relative to the workspace.",
+        parameters: local_tool_grep_parameters,
+        execute: execute_grep_tool,
+    },
+    LocalToolDescriptor {
+        name: "bash",
+        description: "Run a non-interactive shell command in the current workspace. Prefer read_file, grep, and write_file for file operations.",
+        parameters: local_tool_bash_parameters,
+        execute: execute_bash_tool,
+    },
+];
+
+fn local_openai_tools(model: &ResolvedLocalLlm) -> Vec<Value> {
+    let enabled = model.enabled_tools();
+    LOCAL_TOOL_REGISTRY
+        .iter()
+        .filter(|tool| {
+            enabled
+                .as_ref()
+                .map_or(true, |enabled| enabled.contains(tool.name))
+        })
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": (tool.parameters)(),
                 }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Create or overwrite a UTF-8 text file in the current workspace. The path must be relative to the workspace. Existing files require overwrite=true.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Workspace-relative file path to write"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Complete UTF-8 file contents"
-                        },
-                        "overwrite": {
-                            "type": "boolean",
-                            "description": "Set to true to replace an existing file"
-                        }
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": false
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "search_replace",
-                "description": "Make a targeted edit in an existing UTF-8 file by replacing an exact text block. The search text must match exactly once.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Workspace-relative file path to edit"
-                        },
-                        "search": {
-                            "type": "string",
-                            "description": "Exact text to replace. It must appear exactly once in the file."
-                        },
-                        "replace": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        }
-                    },
-                    "required": ["path", "search", "replace"],
-                    "additionalProperties": false
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "grep",
-                "description": "Search workspace files for a Rust-regex pattern. The path must be relative to the workspace.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Regular expression to search for"
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Workspace-relative file or directory to search. Defaults to the workspace root."
-                        },
-                        "max_matches": {
-                            "type": "integer",
-                            "description": "Maximum number of matching lines to return"
-                        }
-                    },
-                    "required": ["pattern"],
-                    "additionalProperties": false
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a non-interactive shell command in the current workspace. Prefer read_file, grep, and write_file for file operations.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to run"
-                        },
-                        "timeout_secs": {
-                            "type": "integer",
-                            "description": "Timeout in seconds. Defaults to 30 and is capped at 120."
-                        }
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }
-            }
-        }),
-    ]
+            })
+        })
+        .collect()
 }
 
 async fn call_anthropic_compatible(
@@ -1901,6 +1885,112 @@ async fn call_anthropic_compatible(
     extract_anthropic_text(&value).context("local LLM response did not contain text content")
 }
 
+fn local_tool_read_file_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative file path to read"
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Zero-based line offset to start reading from"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to read"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
+fn local_tool_write_file_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative file path to write"
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete UTF-8 file contents"
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Set to true to replace an existing file"
+            }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+    })
+}
+
+fn local_tool_search_replace_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative file path to edit"
+            },
+            "search": {
+                "type": "string",
+                "description": "Exact text to replace. It must appear exactly once in the file."
+            },
+            "replace": {
+                "type": "string",
+                "description": "Replacement text"
+            }
+        },
+        "required": ["path", "search", "replace"],
+        "additionalProperties": false
+    })
+}
+
+fn local_tool_grep_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Regular expression to search for"
+            },
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative file or directory to search. Defaults to the workspace root."
+            },
+            "max_matches": {
+                "type": "integer",
+                "description": "Maximum number of matching lines to return"
+            }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    })
+}
+
+fn local_tool_bash_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command to run"
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "description": "Timeout in seconds. Defaults to 30 and is capped at 120."
+            }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
+}
+
 fn completion_url(base_url: &str, endpoint: &str) -> String {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.ends_with(endpoint) {
@@ -1925,14 +2015,11 @@ fn apply_configured_headers(
 }
 
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
-    match tool_call.name.as_str() {
-        "read_file" => execute_read_file_tool(tool_call, workspace),
-        "write_file" => execute_write_file_tool(tool_call, workspace),
-        "search_replace" => execute_search_replace_tool(tool_call, workspace),
-        "grep" => execute_grep_tool(tool_call, workspace),
-        "bash" => execute_bash_tool(tool_call, workspace),
-        name => anyhow::bail!("unsupported local tool: {name}"),
-    }
+    let descriptor = LOCAL_TOOL_REGISTRY
+        .iter()
+        .find(|tool| tool.name == tool_call.name)
+        .context("unsupported local tool")?;
+    (descriptor.execute)(tool_call, workspace)
 }
 
 fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
@@ -2515,8 +2602,8 @@ impl PendingOpenAiAssistantTurn {
     }
 }
 
-fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
-    let mut messages = vec![openai_system_message()];
+fn openai_messages_for_request(request: &maa::Request, model: &ResolvedLocalLlm) -> Vec<Value> {
+    let mut messages = vec![openai_system_message(model)];
     let mut local_tool_call_ids = std::collections::HashSet::new();
     let mut local_tool_result_ids = std::collections::HashSet::new();
     let mut pending_assistant = PendingOpenAiAssistantTurn::default();
@@ -2614,14 +2701,14 @@ fn current_tool_results_for_request(request: &maa::Request) -> Vec<LocalToolResu
         .collect()
 }
 
-fn openai_messages_from_prompt(prompt: &str) -> Vec<Value> {
-    vec![openai_system_message(), openai_user_message(prompt)]
+fn openai_messages_from_prompt(prompt: &str, model: &ResolvedLocalLlm) -> Vec<Value> {
+    vec![openai_system_message(model), openai_user_message(prompt)]
 }
 
-fn openai_system_message() -> Value {
+fn openai_system_message(model: &ResolvedLocalLlm) -> Value {
     json!({
         "role": "system",
-        "content": local_agent_system_prompt()
+        "content": local_agent_system_prompt(model)
     })
 }
 
@@ -2988,14 +3075,30 @@ where
     })
 }
 
-fn local_agent_system_prompt() -> &'static str {
-    "You are a local coding agent running inside a Warp OSS loopback sidecar. \
+const DEFAULT_LOCAL_AGENT_SYSTEM_PROMPT: &str = "You are a local coding agent running inside a Warp OSS loopback sidecar. \
 Use tools to inspect and modify the user's current workspace. \
-Available tools: read_file for reading workspace files, grep for searching, search_replace for targeted exact-match edits, write_file for creating or overwriting files, and bash for non-interactive workspace commands. \
+Available tools: {tools}. \
 Before editing an existing file, inspect it with read_file or grep. \
 Prefer read_file, grep, search_replace, and write_file over bash for file operations. \
 After making code changes, run a relevant verification command with bash when one is reasonably available. \
-Keep final answers concise and report what changed plus any verification result."
+Keep final answers concise and report what changed plus any verification result.";
+
+fn local_agent_system_prompt(model: &ResolvedLocalLlm) -> String {
+    let tool_names = local_openai_tools(model)
+        .into_iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let tools = if tool_names.is_empty() {
+        "no tools".to_string()
+    } else {
+        tool_names.join(", ")
+    };
+    let configured = model.configured_system_prompt().unwrap_or(DEFAULT_LOCAL_AGENT_SYSTEM_PROMPT);
+    if configured.contains("{tools}") {
+        configured.replace("{tools}", &tools)
+    } else {
+        format!("{configured}\nAvailable tools: {tools}.")
+    }
 }
 
 fn openai_assistant_message(turn: &LocalAssistantTurn) -> Value {
@@ -4077,6 +4180,43 @@ fn llm_config_path() -> PathBuf {
     warp_core::paths::config_local_dir().join(LOCAL_LLM_FILE)
 }
 
+fn resolve_agent_system_prompt(path: &str) -> Result<String> {
+    let path = resolve_agent_path(path)?;
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read agent prompt file {}", path.display()))
+        .map(|contents| contents.trim().to_owned())
+        .map(|contents| {
+            if contents.is_empty() {
+                String::new()
+            } else {
+                contents
+            }
+        })
+}
+
+fn resolve_agent_path(path: &str) -> Result<PathBuf> {
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("system prompt file path is empty");
+    }
+
+    let resolved = if path.starts_with("~/") {
+        let Some(home) = std::env::var_os("HOME") else {
+            anyhow::bail!("HOME is not set, cannot resolve {path}");
+        };
+        let home = PathBuf::from(home);
+        if path.len() <= 2 {
+            home
+        } else {
+            home.join(&path[2..])
+        }
+    } else {
+        warp_core::paths::config_local_dir().join(path)
+    };
+
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4095,6 +4235,8 @@ mod tests {
             thinking: "off".to_string(),
             thinking_budget: None,
             description: None,
+            system_prompt: None,
+            enabled_tools: None,
         }
     }
 
@@ -4254,12 +4396,68 @@ thinking_budget = 2048
 
     #[test]
     fn local_agent_system_prompt_describes_available_tools() {
-        let prompt = local_agent_system_prompt();
+        let model = test_openai_model("qwen");
+        let prompt = local_agent_system_prompt(&model);
 
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("write_file"));
         assert!(prompt.contains("grep"));
         assert!(prompt.contains("bash"));
+    }
+
+    #[test]
+    fn resolves_tilde_agent_prompt_path_relative_to_home() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let prompt = tempdir.path().join("local_prompt.txt");
+        fs::write(&prompt, "custom prompt").unwrap();
+        let home = tempdir.path().to_string_lossy().to_string();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let path = resolve_agent_path("~/local_prompt.txt").unwrap();
+        assert_eq!(path, prompt);
+        assert_eq!(resolve_agent_system_prompt("~/local_prompt.txt").unwrap(), "custom prompt");
+
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn local_llm_config_resolves_agent_system_prompt_and_enabled_tools() {
+        let config: LocalLlmConfig = toml::from_str(
+            r#"
+active_model = "qwen"
+
+[agent]
+system_prompt = "Use only requested tools: {tools}"
+enabled_tools = ["read_file", "grep"]
+
+[[providers]]
+name = "dashscope"
+api_base = "https://example.test/v1"
+api_key = "test-token"
+api_style = "openai"
+
+[[models]]
+name = "qwen"
+provider = "dashscope"
+"#,
+        )
+        .unwrap();
+
+        let model = config.active_model().unwrap();
+        let prompt = local_agent_system_prompt(&model);
+        let tools = local_openai_tools(&model)
+            .into_iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools, vec!["read_file", "grep"]);
+        assert_eq!(model.configured_system_prompt(), Some("Use only requested tools: {tools}"));
+        assert_eq!(prompt, "Use only requested tools: read_file, grep");
     }
 
     #[test]
@@ -4328,7 +4526,8 @@ thinking_budget = 2048
             ..Default::default()
         };
 
-        let messages = openai_messages_for_request(&request);
+        let model = test_openai_model("qwen");
+        let messages = openai_messages_for_request(&request, &model);
 
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "first question");
@@ -4467,7 +4666,8 @@ thinking_budget = 2048
             ..Default::default()
         };
 
-        let messages = openai_messages_for_request(&request);
+        let model = test_openai_model("qwen");
+        let messages = openai_messages_for_request(&request, &model);
 
         assert_eq!(
             messages[1]["tool_calls"][0]["function"]["name"],
@@ -4565,7 +4765,8 @@ thinking_budget = 2048
             ..Default::default()
         };
 
-        let messages = openai_messages_for_request(&request);
+        let model = test_openai_model("qwen");
+        let messages = openai_messages_for_request(&request, &model);
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
@@ -4741,7 +4942,8 @@ thinking_budget = 2048
             ..Default::default()
         };
 
-        let messages = openai_messages_for_request(&request);
+        let model = test_openai_model("qwen");
+        let messages = openai_messages_for_request(&request, &model);
 
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[1]["role"], "user");
@@ -4973,7 +5175,7 @@ thinking_budget = 2048
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let output = run_openai_agent_loop(
-            openai_messages_from_prompt("What is in notes.md?"),
+            openai_messages_from_prompt("What is in notes.md?", &test_openai_model("qwen3.6-plus")),
             tempdir.path(),
             {
                 let calls = calls.clone();
@@ -5027,7 +5229,7 @@ thinking_budget = 2048
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let output = run_openai_agent_loop_with_progress(
-            openai_messages_from_prompt("What is in notes.md?"),
+            openai_messages_from_prompt("What is in notes.md?", &test_openai_model("qwen3.6-plus")),
             tempdir.path(),
             "reasoning_content",
             {
@@ -5248,12 +5450,14 @@ thinking_budget = 2048
             thinking: "off".to_string(),
             thinking_budget: None,
             description: None,
+            system_prompt: None,
+            enabled_tools: None,
         };
 
         let output = call_openai_compatible(
             &reqwest::Client::new(),
             &model,
-            openai_messages_from_prompt("What is in notes.md?"),
+            openai_messages_from_prompt("What is in notes.md?", &test_openai_model("qwen3.6-plus")),
             tempdir.path(),
         )
         .await
@@ -5291,7 +5495,7 @@ thinking_budget = 2048
         let tool_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let tool_results = Arc::new(std::sync::Mutex::new(Vec::new()));
         let run = run_openai_agent_loop_autonomous_with_progress(
-            openai_messages_from_prompt("What is in notes.md?"),
+            openai_messages_from_prompt("What is in notes.md?", &test_openai_model("qwen3.6-plus")),
             tempdir.path(),
             "reasoning_content",
             {
