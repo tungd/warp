@@ -26,6 +26,7 @@ use crate::{
         ChipMenuType, DisplayChipMenu, FixedFooter, GenericMenuItem, PromptDisplayMenuEvent,
     },
     report_if_error,
+    server::cloud_objects::update_manager::UpdateManager,
     server::ids::SyncId,
     terminal::input::{
         HandoffComposeState, HandoffComposeStateEvent, MenuPositioning, MenuPositioningProvider,
@@ -361,6 +362,9 @@ impl EnvironmentSelector {
         self.is_menu_open = is_open;
         if is_open {
             send_telemetry_from_ctx!(CloudAgentTelemetryEvent::EnvironmentSelectorOpened, ctx);
+            UpdateManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.refresh_updated_objects(ctx);
+            });
             ctx.focus(&self.dropdown);
             self.highlight_selected_environment(ctx);
         }

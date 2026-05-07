@@ -1471,6 +1471,9 @@ async fn graphql_v2(
         | "ListAIConversations"
         | "listAIConversations" => list_ai_conversations_response(),
         "UpdateAgentTask" | "updateAgentTask" => update_agent_task_response(),
+        "GetCloudEnvironments" | "getCloudEnvironments" => {
+            get_cloud_environments_response(&state).await
+        }
         "GetUpdatedCloudObjects" | "getUpdatedCloudObjects" => {
             get_updated_cloud_objects_response(&state, &body).await
         }
@@ -3583,6 +3586,37 @@ fn update_agent_task_response() -> Value {
     })
 }
 
+async fn get_cloud_environments_response(state: &ServerState) -> Value {
+    let workers = state
+        .discovered_workers
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    get_cloud_environments_response_for_workers(&state.account, &workers)
+}
+
+fn get_cloud_environments_response_for_workers(
+    account: &LocalAccount,
+    workers: &[worker_discovery::DiscoveredWorker],
+) -> Value {
+    let cloud_environments = workers
+        .iter()
+        .map(|worker| synthetic_peer_cloud_environment(account, worker))
+        .collect::<Vec<_>>();
+
+    json!({
+        "data": {
+            "getCloudEnvironments": {
+                "__typename": "GetCloudEnvironmentsOutput",
+                "cloudEnvironments": cloud_environments,
+                "responseContext": response_context(),
+            },
+        },
+    })
+}
+
 async fn get_updated_cloud_objects_response(state: &ServerState, request_body: &Value) -> Value {
     let workers = state
         .discovered_workers
@@ -3649,14 +3683,7 @@ fn synthetic_peer_environment_object(
     let environment_id = worker_discovery::synthetic_environment_id_for_worker(worker);
     let owner_uid = stable_server_id("wuser-", &account.user_id);
     let now = chrono::Utc::now().to_rfc3339();
-    let serialized_model = json!({
-        "name": worker.display_name,
-        "description": format!("WarpSOLO peer at {}", worker.url),
-        "github_repos": [],
-        "docker_image": "warpsolo/peer",
-        "setup_commands": [],
-    })
-    .to_string();
+    let serialized_model = synthetic_peer_environment_serialized_model(worker);
 
     json!({
         "__typename": "GenericStringObject",
@@ -3690,6 +3717,53 @@ fn synthetic_peer_environment_object(
         },
         "serializedModel": serialized_model,
     })
+}
+
+fn synthetic_peer_cloud_environment(
+    account: &LocalAccount,
+    worker: &worker_discovery::DiscoveredWorker,
+) -> Value {
+    let environment_id = worker_discovery::synthetic_environment_id_for_worker(worker);
+    let owner_uid = stable_server_id("wuser-", &account.user_id);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    json!({
+        "__typename": "CloudEnvironment",
+        "uid": environment_id,
+        "config": {
+            "__typename": "CloudEnvironmentConfig",
+            "name": worker.display_name,
+            "description": format!("WarpSOLO peer at {}", worker.url),
+            "githubRepos": [],
+            "dockerImage": "warpsolo/peer",
+            "setupCommands": [],
+            "providers": null,
+        },
+        "creator": null,
+        "lastEditor": null,
+        "lastTaskCreated": null,
+        "lastTaskRunTimestamp": null,
+        "lastUpdated": now,
+        "scope": {
+            "__typename": "Space",
+            "uid": owner_uid,
+            "type": "User",
+        },
+        "setupFailed": false,
+    })
+}
+
+fn synthetic_peer_environment_serialized_model(
+    worker: &worker_discovery::DiscoveredWorker,
+) -> String {
+    json!({
+        "name": worker.display_name,
+        "description": format!("WarpSOLO peer at {}", worker.url),
+        "github_repos": [],
+        "docker_image": "warpsolo/peer",
+        "setup_commands": [],
+    })
+    .to_string()
 }
 
 fn stable_server_id(prefix: &str, value: &str) -> String {
@@ -4031,6 +4105,13 @@ thinking_budget = 2048
         ))
         .unwrap();
         let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_cloud_environments::GetCloudEnvironmentsQuery,
+        > = serde_json::from_value(get_cloud_environments_response_for_workers(
+            &test_account(),
+            &[],
+        ))
+        .unwrap();
+        let _: cynic::GraphQlResponse<
             warp_graphql::queries::get_workspaces_metadata_for_user::GetWorkspacesMetadataForUser,
         > = serde_json::from_value(get_workspaces_metadata_for_user_response()).unwrap();
 
@@ -4083,6 +4164,22 @@ thinking_budget = 2048
             .as_str()
             .expect("serialized model")
             .contains("peer@example.local"));
+    }
+
+    #[test]
+    fn synthetic_peer_environments_parse_as_cloud_environments() {
+        let account = test_account();
+        let workers = vec![test_worker("local-device-peer")];
+        let response = get_cloud_environments_response_for_workers(&account, &workers);
+
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_cloud_environments::GetCloudEnvironmentsQuery,
+        > = serde_json::from_value(response.clone()).unwrap();
+
+        let env = &response["data"]["getCloudEnvironments"]["cloudEnvironments"][0];
+        assert_eq!(env["__typename"], "CloudEnvironment");
+        assert_eq!(env["config"]["name"], "peer@example.local");
+        assert_eq!(env["config"]["dockerImage"], "warpsolo/peer");
     }
 
     #[test]
