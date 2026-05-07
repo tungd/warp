@@ -463,22 +463,25 @@ async fn generate_local_agent_output(
     state: &ServerState,
     request: &maa::Request,
 ) -> Result<String> {
-    let prompt = extract_user_prompt(request)
-        .filter(|prompt| !prompt.trim().is_empty())
-        .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
-
     let model = LocalLlmConfig::load()?.active_model()?;
 
     match model.api_style.trim().to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" => call_anthropic_compatible(&state.client, &model, &prompt).await,
+        "anthropic" | "claude" => {
+            let prompt = extract_user_prompt(request)
+                .filter(|prompt| !prompt.trim().is_empty())
+                .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
+            call_anthropic_compatible(&state.client, &model, &prompt).await
+        }
         "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
         | "gemini" | "openrouter" => {
             let workspace = workspace_for_request(request);
-            call_openai_compatible(&state.client, &model, &prompt, &workspace).await
+            let messages = openai_messages_for_request(request);
+            call_openai_compatible(&state.client, &model, messages, &workspace).await
         }
         _ => {
             let workspace = workspace_for_request(request);
-            call_openai_compatible(&state.client, &model, &prompt, &workspace).await
+            let messages = openai_messages_for_request(request);
+            call_openai_compatible(&state.client, &model, messages, &workspace).await
         }
     }
 }
@@ -532,10 +535,10 @@ fn default_workspace() -> PathBuf {
 async fn call_openai_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
-    prompt: &str,
+    messages: Vec<Value>,
     workspace: &Path,
 ) -> Result<String> {
-    run_openai_agent_loop(prompt, workspace, |messages| {
+    run_openai_agent_loop(messages, workspace, |messages| {
         call_openai_chat_completion(client, model, messages)
     })
     .await
@@ -1250,8 +1253,196 @@ fn text_value(value: &Value) -> Option<String> {
     }
 }
 
+fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
+    let mut messages = vec![openai_system_message()];
+    let mut local_tool_call_ids = std::collections::HashSet::new();
+
+    if let Some(task_context) = request.task_context.as_ref() {
+        for task in &task_context.tasks {
+            for message in &task.messages {
+                match message.message.as_ref() {
+                    Some(maa::message::Message::UserQuery(query)) => {
+                        if !query.query.trim().is_empty() {
+                            messages.push(openai_user_message(&query.query));
+                        }
+                    }
+                    Some(maa::message::Message::AgentOutput(output)) => {
+                        if !output.text.trim().is_empty() {
+                            messages.push(openai_assistant_text_message(&output.text));
+                        }
+                    }
+                    Some(maa::message::Message::ToolCall(tool_call)) => {
+                        if let Some(local_tool_call) = local_tool_call_from_api(tool_call) {
+                            local_tool_call_ids.insert(local_tool_call.id.clone());
+                            messages.push(openai_assistant_message(&LocalAssistantTurn {
+                                content: String::new(),
+                                tool_calls: vec![local_tool_call],
+                            }));
+                        }
+                    }
+                    Some(maa::message::Message::ToolCallResult(result))
+                        if local_tool_call_ids.contains(&result.tool_call_id) =>
+                    {
+                        messages.push(openai_tool_result_message(&LocalToolResult {
+                            tool_call_id: result.tool_call_id.clone(),
+                            name: "tool".to_string(),
+                            content: api_tool_result_text(result),
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let prompt = extract_user_prompt(request)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
+    messages.push(openai_user_message(&prompt));
+    messages
+}
+
+fn openai_messages_from_prompt(prompt: &str) -> Vec<Value> {
+    vec![openai_system_message(), openai_user_message(prompt)]
+}
+
+fn openai_system_message() -> Value {
+    json!({
+        "role": "system",
+        "content": local_agent_system_prompt()
+    })
+}
+
+fn openai_user_message(content: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": content
+    })
+}
+
+fn openai_assistant_text_message(content: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": content
+    })
+}
+
+fn local_tool_call_from_api(tool_call: &maa::message::ToolCall) -> Option<LocalToolCall> {
+    let tool = tool_call.tool.as_ref()?;
+    let (name, arguments) = match tool {
+        maa::message::tool_call::Tool::RunShellCommand(command) => (
+            "bash",
+            json!({
+                "command": command.command
+            }),
+        ),
+        maa::message::tool_call::Tool::ReadFiles(read_files) => {
+            let file = read_files.files.first()?;
+            let mut arguments = json!({
+                "path": file.name
+            });
+            if let Some(range) = file.line_ranges.first() {
+                arguments["offset"] = json!(range.start.saturating_sub(1));
+                if range.end >= range.start {
+                    arguments["limit"] = json!(range.end - range.start + 1);
+                }
+            }
+            ("read_file", arguments)
+        }
+        maa::message::tool_call::Tool::Grep(grep) => (
+            "grep",
+            json!({
+                "pattern": grep.queries.first()?,
+                "path": if grep.path.is_empty() { "." } else { grep.path.as_str() }
+            }),
+        ),
+        maa::message::tool_call::Tool::ApplyFileDiffs(diffs) => {
+            let diff = diffs.diffs.first()?;
+            (
+                "search_replace",
+                json!({
+                    "path": diff.file_path,
+                    "search": diff.search,
+                    "replace": diff.replace
+                }),
+            )
+        }
+        _ => return None,
+    };
+
+    Some(LocalToolCall {
+        id: tool_call.tool_call_id.clone(),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn api_tool_result_text(result: &maa::message::ToolCallResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::message::tool_call_result::Result::RunShellCommand(result)) => {
+            match result.result.as_ref() {
+                Some(maa::run_shell_command_result::Result::CommandFinished(finished)) => {
+                    format!(
+                        "Command: {}\nExit code: {}\n\n{}",
+                        result.command, finished.exit_code, finished.output
+                    )
+                }
+                _ => format!("Command result for {} is unavailable.", result.command),
+            }
+        }
+        Some(maa::message::tool_call_result::Result::ReadFiles(result)) => {
+            match result.result.as_ref() {
+                Some(maa::read_files_result::Result::TextFilesSuccess(success)) => success
+                    .files
+                    .iter()
+                    .map(|file| format!("{}:\n{}", file.file_path, file.content))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                Some(maa::read_files_result::Result::AnyFilesSuccess(success)) => {
+                    format!("Read {} file(s).", success.files.len())
+                }
+                Some(maa::read_files_result::Result::Error(error)) => error.message.clone(),
+                None => "Read file result is unavailable.".to_string(),
+            }
+        }
+        Some(maa::message::tool_call_result::Result::Grep(result)) => {
+            match result.result.as_ref() {
+                Some(maa::grep_result::Result::Success(success)) => success
+                    .matched_files
+                    .iter()
+                    .map(|file| {
+                        let lines = file
+                            .matched_lines
+                            .iter()
+                            .map(|line| line.line_number.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{}: {}", file.file_path, lines)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Some(maa::grep_result::Result::Error(error)) => error.message.clone(),
+                None => "Grep result is unavailable.".to_string(),
+            }
+        }
+        Some(maa::message::tool_call_result::Result::ApplyFileDiffs(result)) => {
+            match result.result.as_ref() {
+                Some(maa::apply_file_diffs_result::Result::Success(success)) => {
+                    format!(
+                        "Applied file edits to {} file(s).",
+                        success.updated_files_v2.len() + success.deleted_files.len()
+                    )
+                }
+                Some(maa::apply_file_diffs_result::Result::Error(error)) => error.message.clone(),
+                None => "File edit result is unavailable.".to_string(),
+            }
+        }
+        _ => "Tool result is unavailable.".to_string(),
+    }
+}
+
 async fn run_openai_agent_loop<F, Fut>(
-    prompt: &str,
+    mut messages: Vec<Value>,
     workspace: &Path,
     mut complete: F,
 ) -> Result<String>
@@ -1259,17 +1450,6 @@ where
     F: FnMut(Vec<Value>) -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
-    let mut messages = vec![
-        json!({
-            "role": "system",
-            "content": local_agent_system_prompt()
-        }),
-        json!({
-            "role": "user",
-            "content": prompt
-        }),
-    ];
-
     for _ in 0..LOCAL_AGENT_MAX_TURNS {
         let response = complete(messages.clone()).await?;
         let turn = parse_openai_assistant_turn(&response)?;
@@ -1856,6 +2036,82 @@ mod tests {
     }
 
     #[test]
+    fn openai_messages_include_prior_task_messages() {
+        let request = maa::Request {
+            task_context: Some(maa::request::TaskContext {
+                tasks: vec![maa::Task {
+                    id: "task-1".to_string(),
+                    description: "task".to_string(),
+                    dependencies: None,
+                    messages: vec![
+                        maa::Message {
+                            id: "m1".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r1".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::UserQuery(
+                                maa::message::UserQuery {
+                                    query: "first question".to_string(),
+                                    context: None,
+                                    referenced_attachments: HashMap::new(),
+                                    mode: None,
+                                    intended_agent: Default::default(),
+                                },
+                            )),
+                        },
+                        maa::Message {
+                            id: "m2".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r1".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::AgentOutput(
+                                maa::message::AgentOutput {
+                                    text: "first answer".to_string(),
+                                },
+                            )),
+                        },
+                    ],
+                    summary: String::new(),
+                    server_data: String::new(),
+                }],
+            }),
+            input: Some(maa::request::Input {
+                context: None,
+                r#type: Some(maa::request::input::Type::UserInputs(
+                    maa::request::input::UserInputs {
+                        inputs: vec![maa::request::input::user_inputs::UserInput {
+                            input: Some(
+                                maa::request::input::user_inputs::user_input::Input::UserQuery(
+                                    maa::request::input::UserQuery {
+                                        query: "follow up".to_string(),
+                                        referenced_attachments: HashMap::new(),
+                                        mode: None,
+                                        intended_agent: Default::default(),
+                                    },
+                                ),
+                            ),
+                        }],
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let messages = openai_messages_for_request(&request);
+
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "first question");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "first answer");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "follow up");
+    }
+
+    #[test]
     fn executes_read_file_tool_relative_to_workspace() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("notes.md");
@@ -2046,46 +2302,50 @@ mod tests {
         fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let output = run_openai_agent_loop("What is in notes.md?", tempdir.path(), {
-            let calls = calls.clone();
-            move |messages: Vec<Value>| {
+        let output = run_openai_agent_loop(
+            openai_messages_from_prompt("What is in notes.md?"),
+            tempdir.path(),
+            {
                 let calls = calls.clone();
-                async move {
-                    match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                        0 => Ok(json!({
-                            "choices": [{
-                                "message": {
-                                    "content": "",
-                                    "tool_calls": [{
-                                        "id": "call_read",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "read_file",
-                                            "arguments": "{\"path\":\"notes.md\"}"
-                                        }
-                                    }]
-                                }
-                            }]
-                        })),
-                        1 => {
-                            assert!(messages.iter().any(|message| {
-                                message["role"] == "tool"
-                                    && message["tool_call_id"] == "call_read"
-                                    && message["content"] == "local notes"
-                            }));
-                            Ok(json!({
+                move |messages: Vec<Value>| {
+                    let calls = calls.clone();
+                    async move {
+                        match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 => Ok(json!({
                                 "choices": [{
                                     "message": {
-                                        "content": "notes.md says: local notes"
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "id": "call_read",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"notes.md\"}"
+                                            }
+                                        }]
                                     }
                                 }]
-                            }))
+                            })),
+                            1 => {
+                                assert!(messages.iter().any(|message| {
+                                    message["role"] == "tool"
+                                        && message["tool_call_id"] == "call_read"
+                                        && message["content"] == "local notes"
+                                }));
+                                Ok(json!({
+                                    "choices": [{
+                                        "message": {
+                                            "content": "notes.md says: local notes"
+                                        }
+                                    }]
+                                }))
+                            }
+                            _ => panic!("agent loop called the model too many times"),
                         }
-                        _ => panic!("agent loop called the model too many times"),
                     }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap();
 
@@ -2220,7 +2480,7 @@ mod tests {
         let output = call_openai_compatible(
             &reqwest::Client::new(),
             &model,
-            "What is in notes.md?",
+            openai_messages_from_prompt("What is in notes.md?"),
             tempdir.path(),
         )
         .await
