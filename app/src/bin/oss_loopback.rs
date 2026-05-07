@@ -52,6 +52,8 @@ use warp_multi_agent_api as maa;
 mod agent_state;
 #[path = "oss_loopback/bonjour.rs"]
 mod bonjour;
+#[path = "oss_loopback/cloud_agent.rs"]
+mod cloud_agent;
 #[path = "oss_loopback/coordinator.rs"]
 mod coordinator;
 #[path = "oss_loopback/state.rs"]
@@ -318,6 +320,7 @@ impl ResolvedLocalLlm {
 struct ServerState {
     account: Arc<LocalAccount>,
     client: reqwest::Client,
+    cloud_agent_runs: cloud_agent::CloudAgentRunStore,
     discovered_workers: bonjour::DiscoveredWorkerStore,
     shared_sessions: SharedSessionStore,
     worker_config: Arc<LocalAgentWorkerConfig>,
@@ -376,6 +379,7 @@ impl LoopbackServer {
         let state = ServerState {
             account,
             client,
+            cloud_agent_runs: cloud_agent::new_cloud_agent_run_store(),
             discovered_workers: bonjour::new_discovered_worker_store(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             worker_config,
@@ -401,6 +405,20 @@ impl LoopbackServer {
         let router = Router::new()
             .route("/healthz", get(healthz))
             .route("/graphql/v2", post(graphql_v2))
+            .route("/api/v1/agent/run", post(cloud_agent::spawn_agent))
+            .route("/api/v1/agent/runs", get(cloud_agent::list_agent_runs))
+            .route(
+                "/api/v1/agent/runs/{run_id}",
+                get(cloud_agent::get_agent_run),
+            )
+            .route(
+                "/api/v1/agent/runs/{run_id}/followups",
+                post(cloud_agent::submit_agent_followup),
+            )
+            .route(
+                "/api/v1/agent/tasks/{run_id}/cancel",
+                post(cloud_agent::cancel_agent_run),
+            )
             .route("/ai/multi-agent", post(multi_agent))
             .route("/ai/passive-suggestions", post(passive_suggestions))
             .route("/proxy/customToken", post(proxy_token))
