@@ -37,7 +37,7 @@ pub struct ChannelState {
 impl ChannelState {
     pub fn init() -> Self {
         let channel = Channel::Oss;
-        let app_id = AppId::new("dev", "warp", "WarpOss");
+        let app_id = AppId::new("dev", "warp", "WarpSOLO");
         Self {
             channel,
             additional_features: Default::default(),
@@ -106,6 +106,19 @@ impl ChannelState {
             .config
             .server_config
             .session_sharing_server_url = Some(url);
+        Ok(())
+    }
+
+    pub fn override_session_sharing_public_root_url(
+        url: impl Into<Cow<'static, str>>,
+    ) -> Result<(), ParseError> {
+        let url = url.into();
+        Url::parse(&url)?;
+        CHANNEL_STATE
+            .lock()
+            .config
+            .server_config
+            .session_sharing_public_root_url = Some(url);
         Ok(())
     }
 
@@ -252,6 +265,21 @@ impl ChannelState {
                 Some(Cow::Borrowed("fake_session_sharing_url"))
             } else {
                 CHANNEL_STATE.lock().config.server_config.session_sharing_server_url.clone()
+            }
+        }
+    }
+
+    pub fn session_sharing_public_root_url() -> Option<Cow<'static, str>> {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "test-util")] {
+                None
+            } else {
+                CHANNEL_STATE
+                    .lock()
+                    .config
+                    .server_config
+                    .session_sharing_public_root_url
+                    .clone()
             }
         }
     }

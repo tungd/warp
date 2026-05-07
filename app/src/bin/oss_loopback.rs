@@ -14,19 +14,39 @@ use std::{process::Stdio, time::Instant};
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
-    extract::{Query, State},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Path as AxumPath, Query, State,
+    },
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{prelude::BASE64_URL_SAFE, Engine as _};
+use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 #[cfg(test)]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::{runtime::Runtime, sync::mpsc};
+use session_sharing_protocol::{
+    common::{
+        ActivePrompt, AbsentViewer, CommandExecutionFailureReason, CommandExecutionRequestId,
+        ControlActionFailureReason, ControlActionRequestId, InputReplicaId, InputUpdate,
+        OrderedTerminalEvent, ParticipantId, ParticipantInfo, ParticipantList,
+        ParticipantPresenceUpdate, PresenceUpdate, PresentViewer, ProfileData, Role,
+        RoleRequestRejectedReason, RoleRequestResponse, Scrollback, Selection, SessionId,
+        SessionSecret, UniversalDeveloperInputContext, Viewer, WindowSize,
+        WriteToPtyFailureReason,
+    },
+    sharer::{self as sharer_protocol, ReconnectToken},
+    viewer::{self as viewer_protocol, RoleUpdatedReason},
+};
+use tokio::{
+    runtime::Runtime,
+    sync::{mpsc, RwLock},
+};
 use uuid::Uuid;
 #[cfg(test)]
 use walkdir::{DirEntry, WalkDir};
@@ -356,6 +376,36 @@ impl ResolvedLocalLlm {
 struct ServerState {
     account: Arc<LocalAccount>,
     client: reqwest::Client,
+    shared_sessions: SharedSessionStore,
+}
+
+type SharedSessionStore = Arc<RwLock<HashMap<SessionId, SharedSession>>>;
+
+#[derive(Clone)]
+struct ViewerState {
+    tx: mpsc::UnboundedSender<WsMessage>,
+    firebase_uid: String,
+    display_name: String,
+    selection: Selection,
+    role: Role,
+}
+
+struct SharedSession {
+    reconnect_token: ReconnectToken,
+    sharer_id: ParticipantId,
+    sharer_firebase_uid: String,
+    sharer_display_name: String,
+    sharer_selection: Selection,
+    scrollback: Scrollback,
+    active_prompt: ActivePrompt,
+    window_size: WindowSize,
+    init_block_id: session_sharing_protocol::common::BlockId,
+    input_replica_id: InputReplicaId,
+    universal_developer_input_context: Option<UniversalDeveloperInputContext>,
+    source_type: sharer_protocol::SessionSourceType,
+    events: BTreeMap<usize, OrderedTerminalEvent>,
+    sharer_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    viewers: HashMap<ParticipantId, ViewerState>,
 }
 
 pub struct LoopbackServer {
@@ -370,7 +420,11 @@ impl LoopbackServer {
             .timeout(Duration::from_secs(120))
             .build()
             .context("failed to create OSS loopback HTTP client")?;
-        let state = ServerState { account, client };
+        let state = ServerState {
+            account,
+            client,
+            shared_sessions: Arc::new(RwLock::new(HashMap::new())),
+        };
 
         let std_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .context("failed to bind OSS loopback server")?;
@@ -395,6 +449,10 @@ impl LoopbackServer {
             .route("/ai/passive-suggestions", post(passive_suggestions))
             .route("/proxy/customToken", post(proxy_token))
             .route("/proxy/token", post(proxy_token))
+            .route("/session/{session_id}", get(session_page))
+            .route("/sessions/create", get(create_session_ws))
+            .route("/sessions/join/{session_id}", get(join_session_ws))
+            .route("/sessions/{session_id}/resume", get(resume_session_ws))
             .with_state(state);
 
         runtime.spawn(async move {
@@ -422,6 +480,10 @@ impl LoopbackServer {
     pub fn server_root_url(&self) -> &str {
         &self.server_root_url
     }
+
+    pub fn session_sharing_server_url(&self) -> String {
+        self.server_root_url.replacen("http://", "ws://", 1)
+    }
 }
 
 async fn healthz(State(state): State<ServerState>) -> Json<Value> {
@@ -434,6 +496,855 @@ async fn healthz(State(state): State<ServerState>) -> Json<Value> {
 
 async fn proxy_token(State(state): State<ServerState>) -> Json<Value> {
     Json(firebase_token_response(&state.account))
+}
+
+async fn session_page(AxumPath(session_id): AxumPath<String>) -> Response {
+    if session_id.parse::<SessionId>().is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let native_url = format!("warposs://shared_session/{session_id}");
+    Html(format!(
+        r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url={native_url}">
+  <title>Open WarpSOLO Session</title>
+</head>
+<body>
+  <a href="{native_url}">Open WarpSOLO session</a>
+  <script>location.href = "{native_url}";</script>
+</body>
+</html>"#
+    ))
+    .into_response()
+}
+
+async fn create_session_ws(
+    State(state): State<ServerState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_create_session_socket(state, socket))
+        .into_response()
+}
+
+async fn join_session_ws(
+    State(state): State<ServerState>,
+    AxumPath(session_id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_join_session_socket(state, session_id, socket))
+        .into_response()
+}
+
+async fn resume_session_ws(
+    State(state): State<ServerState>,
+    AxumPath(session_id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_resume_session_socket(state, session_id, socket))
+        .into_response()
+}
+
+async fn handle_create_session_socket(state: ServerState, socket: WebSocket) {
+    let (out_tx, mut incoming) = split_loopback_socket(socket);
+    let Some(Ok(WsMessage::Text(message))) = incoming.next().await else {
+        return;
+    };
+
+    let init = match sharer_protocol::UpstreamMessage::from_json(&message) {
+        Ok(sharer_protocol::UpstreamMessage::Initialize(init)) => init,
+        Ok(_) | Err(_) => {
+            let _ = send_sharer_message(
+                &out_tx,
+                sharer_protocol::DownstreamMessage::FailedToInitializeSession {
+                    reason: sharer_protocol::FailedToInitializeSessionReason::internal_server_error_without_details(),
+                },
+            );
+            return;
+        }
+    };
+
+    let session_id = SessionId::new();
+    let session_secret = SessionSecret::new();
+    let reconnect_token = ReconnectToken::new();
+    let sharer_id = ParticipantId::new();
+    let sharer_firebase_uid = state.account.user_id.clone();
+    let sharer_display_name = state.account.display_name.clone();
+
+    {
+        let mut sessions = state.shared_sessions.write().await;
+        sessions.insert(
+            session_id,
+            SharedSession {
+                reconnect_token: reconnect_token.clone(),
+                sharer_id: sharer_id.clone(),
+                sharer_firebase_uid: sharer_firebase_uid.clone(),
+                sharer_display_name,
+                sharer_selection: init.selection.clone(),
+                scrollback: init.scrollback,
+                active_prompt: init.active_prompt,
+                window_size: init.window_size,
+                init_block_id: init.init_block_id,
+                input_replica_id: init.input_replica_id,
+                universal_developer_input_context: init.universal_developer_input_context,
+                source_type: init.source_type,
+                events: BTreeMap::new(),
+                sharer_tx: Some(out_tx.clone()),
+                viewers: HashMap::new(),
+            },
+        );
+    }
+
+    let _ = send_sharer_message(
+        &out_tx,
+        sharer_protocol::DownstreamMessage::SessionInitialized {
+            session_id,
+            session_secret,
+            reconnect_token,
+            sharer_id,
+            sharer_firebase_uid,
+        },
+    );
+
+    handle_sharer_messages(state, session_id, out_tx, incoming).await;
+}
+
+async fn handle_resume_session_socket(
+    state: ServerState,
+    session_id: String,
+    socket: WebSocket,
+) {
+    let Ok(session_id) = session_id.parse::<SessionId>() else {
+        return;
+    };
+    let (out_tx, mut incoming) = split_loopback_socket(socket);
+    let Some(Ok(WsMessage::Text(message))) = incoming.next().await else {
+        return;
+    };
+
+    let reconnect = match sharer_protocol::UpstreamMessage::from_json(&message) {
+        Ok(sharer_protocol::UpstreamMessage::Reconnect(reconnect)) => reconnect,
+        Ok(_) | Err(_) => {
+            let _ = send_sharer_message(
+                &out_tx,
+                sharer_protocol::DownstreamMessage::FailedToReconnect {
+                    reason: sharer_protocol::ReconnectionFailedReason::Invalid,
+                },
+            );
+            return;
+        }
+    };
+
+    let mut sessions = state.shared_sessions.write().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        let _ = send_sharer_message(
+            &out_tx,
+            sharer_protocol::DownstreamMessage::FailedToReconnect {
+                reason: sharer_protocol::ReconnectionFailedReason::SessionNotFound,
+            },
+        );
+        return;
+    };
+    if reconnect.reconnect_token != session.reconnect_token {
+        let _ = send_sharer_message(
+            &out_tx,
+            sharer_protocol::DownstreamMessage::FailedToReconnect {
+                reason: sharer_protocol::ReconnectionFailedReason::WrongReconnectionToken,
+            },
+        );
+        return;
+    }
+
+    session.sharer_tx = Some(out_tx.clone());
+    session.sharer_selection = reconnect.selection;
+    let last_received_event_no = session.events.keys().next_back().copied();
+    let participant_list = participant_list(session);
+    drop(sessions);
+
+    let _ = send_sharer_message(
+        &out_tx,
+        sharer_protocol::DownstreamMessage::SessionReconnected {
+            last_received_event_no,
+            participant_list,
+        },
+    );
+    handle_sharer_messages(state, session_id, out_tx, incoming).await;
+}
+
+async fn handle_join_session_socket(
+    state: ServerState,
+    session_id: String,
+    socket: WebSocket,
+) {
+    let Ok(session_id) = session_id.parse::<SessionId>() else {
+        return;
+    };
+    let (out_tx, mut incoming) = split_loopback_socket(socket);
+    let Some(Ok(WsMessage::Text(message))) = incoming.next().await else {
+        return;
+    };
+
+    let init = match viewer_protocol::UpstreamMessage::from_json(&message) {
+        Ok(viewer_protocol::UpstreamMessage::Initialize(init)) => init,
+        Ok(_) | Err(_) => {
+            let _ = send_viewer_message(
+                &out_tx,
+                viewer_protocol::DownstreamMessage::FailedToJoin {
+                    reason: viewer_protocol::FailedToJoinReason::Invalid,
+                },
+            );
+            return;
+        }
+    };
+
+    let mut sessions = state.shared_sessions.write().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        let _ = send_viewer_message(
+            &out_tx,
+            viewer_protocol::DownstreamMessage::FailedToJoin {
+                reason: viewer_protocol::FailedToJoinReason::SessionNotFound,
+            },
+        );
+        return;
+    };
+
+    let viewer_id = init.viewer_id.unwrap_or_else(ParticipantId::new);
+    let rejoining = session.viewers.contains_key(&viewer_id);
+    let viewer_firebase_uid = state.account.user_id.clone();
+    session.viewers.insert(
+        viewer_id.clone(),
+        ViewerState {
+            tx: out_tx.clone(),
+            firebase_uid: viewer_firebase_uid.clone(),
+            display_name: state.account.display_name.clone(),
+            selection: Selection::None,
+            role: Role::Reader,
+        },
+    );
+    let participant_list = participant_list(session);
+    let replay_events = events_after(session, init.last_received_event_no);
+
+    if rejoining {
+        let _ = send_viewer_message(
+            &out_tx,
+            viewer_protocol::DownstreamMessage::RejoinedSuccessfully {
+                participant_list: Box::new(participant_list.clone()),
+            },
+        );
+    } else {
+        #[allow(deprecated)]
+        let joined = viewer_protocol::DownstreamMessage::JoinedSuccessfully {
+            scrollback: Box::new(session.scrollback.clone()),
+            active_prompt: session.active_prompt.clone(),
+            latest_event_no: session.events.keys().next_back().copied(),
+            window_size: session.window_size,
+            participant_list: Box::new(participant_list.clone()),
+            viewer_id: viewer_id.clone(),
+            viewer_firebase_uid,
+            init_block_id: session.init_block_id.clone(),
+            input_replica_id: session.input_replica_id.clone(),
+            universal_developer_input_context: session.universal_developer_input_context.clone(),
+            source_type: (&session.source_type).into(),
+            detailed_source_type: session.source_type.clone(),
+        };
+        let _ = send_viewer_message(&out_tx, joined);
+    }
+
+    fanout_participant_list(session, participant_list);
+    drop(sessions);
+
+    for event in replay_events {
+        let _ = send_viewer_message(
+            &out_tx,
+            viewer_protocol::DownstreamMessage::OrderedTerminalEvent(event),
+        );
+    }
+    handle_viewer_messages(state, session_id, viewer_id, out_tx, incoming).await;
+}
+
+fn split_loopback_socket(
+    socket: WebSocket,
+) -> (
+    mpsc::UnboundedSender<WsMessage>,
+    futures_util::stream::SplitStream<WebSocket>,
+) {
+    let (mut outgoing, incoming) = socket.split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if outgoing.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    (out_tx, incoming)
+}
+
+async fn handle_sharer_messages(
+    state: ServerState,
+    session_id: SessionId,
+    out_tx: mpsc::UnboundedSender<WsMessage>,
+    mut incoming: futures_util::stream::SplitStream<WebSocket>,
+) {
+    while let Some(Ok(WsMessage::Text(message))) = incoming.next().await {
+        let Ok(message) = sharer_protocol::UpstreamMessage::from_json(&message) else {
+            continue;
+        };
+
+        match message {
+            sharer_protocol::UpstreamMessage::Ping { data } => {
+                let _ = send_sharer_message(
+                    &out_tx,
+                    sharer_protocol::DownstreamMessage::Pong { data },
+                );
+            }
+            sharer_protocol::UpstreamMessage::EndSession { reason } => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.remove(&session_id) else {
+                    break;
+                };
+                let viewer_reason = match reason {
+                    sharer_protocol::SessionEndedReason::EndedBySharer => {
+                        viewer_protocol::SessionEndedReason::EndedBySharer
+                    }
+                    sharer_protocol::SessionEndedReason::InactivityLimitReached => {
+                        viewer_protocol::SessionEndedReason::InactivityLimitReached
+                    }
+                    sharer_protocol::SessionEndedReason::ExceededSizeLimit => {
+                        viewer_protocol::SessionEndedReason::ExceededSizeLimit
+                    }
+                };
+                for viewer in session.viewers.values() {
+                    let _ = send_viewer_message(
+                        &viewer.tx,
+                        viewer_protocol::DownstreamMessage::SessionEnded {
+                            reason: viewer_reason,
+                        },
+                    );
+                }
+                break;
+            }
+            sharer_protocol::UpstreamMessage::OrderedTerminalEvent(event) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                let event_no = event.event_no;
+                session.events.insert(event_no, event.clone());
+                for viewer in session.viewers.values() {
+                    let _ = send_viewer_message(
+                        &viewer.tx,
+                        viewer_protocol::DownstreamMessage::OrderedTerminalEvent(event.clone()),
+                    );
+                }
+                let _ = send_sharer_message(
+                    &out_tx,
+                    sharer_protocol::DownstreamMessage::EventsProcessedAck {
+                        latest_processed_event_no: event_no,
+                    },
+                );
+            }
+            sharer_protocol::UpstreamMessage::UpdateSelection(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                session.sharer_selection = update.selection.clone();
+                let presence = ParticipantPresenceUpdate {
+                    participant_id: session.sharer_id.clone(),
+                    update: PresenceUpdate::Selection(update.selection),
+                };
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::ParticipantPresenceUpdated(presence),
+                );
+            }
+            sharer_protocol::UpstreamMessage::UpdateActivePrompt(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                session.active_prompt = update.active_prompt.clone();
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::ActivePromptUpdated(update),
+                );
+            }
+            sharer_protocol::UpstreamMessage::UpdateUniversalDeveloperInputContext(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                let current = session
+                    .universal_developer_input_context
+                    .take()
+                    .unwrap_or_default();
+                session.universal_developer_input_context = Some(update.clone().merge_into(current));
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::UniversalDeveloperInputContextUpdated(
+                        update,
+                    ),
+                );
+            }
+            sharer_protocol::UpstreamMessage::UpdateInput(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                fanout_viewers(session, viewer_protocol::DownstreamMessage::InputUpdated(update));
+            }
+            sharer_protocol::UpstreamMessage::UpdateRole {
+                participant_id,
+                role,
+            } => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                if let Some(viewer) = session.viewers.get_mut(&participant_id) {
+                    viewer.role = role;
+                }
+                let participant_list = participant_list(session);
+                fanout_participant_list(session, participant_list);
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::ParticipantRoleChanged {
+                        participant_id,
+                        reason: RoleUpdatedReason::UpdatedBySharer,
+                        role,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut sessions = state.shared_sessions.write().await;
+    if let Some(session) = sessions.get_mut(&session_id) {
+        if session
+            .sharer_tx
+            .as_ref()
+            .is_some_and(|tx| tx.same_channel(&out_tx))
+        {
+            session.sharer_tx = None;
+        }
+    }
+}
+
+async fn handle_viewer_messages(
+    state: ServerState,
+    session_id: SessionId,
+    viewer_id: ParticipantId,
+    out_tx: mpsc::UnboundedSender<WsMessage>,
+    mut incoming: futures_util::stream::SplitStream<WebSocket>,
+) {
+    while let Some(Ok(WsMessage::Text(message))) = incoming.next().await {
+        let Ok(message) = viewer_protocol::UpstreamMessage::from_json(&message) else {
+            continue;
+        };
+
+        match message {
+            viewer_protocol::UpstreamMessage::Ping { data } => {
+                let _ = send_viewer_message(
+                    &out_tx,
+                    viewer_protocol::DownstreamMessage::Pong { data },
+                );
+            }
+            viewer_protocol::UpstreamMessage::UpdateSelection(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                if let Some(viewer) = session.viewers.get_mut(&viewer_id) {
+                    viewer.selection = update.selection.clone();
+                }
+                let presence = ParticipantPresenceUpdate {
+                    participant_id: viewer_id.clone(),
+                    update: PresenceUpdate::Selection(update.selection),
+                };
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::ParticipantPresenceUpdated(
+                        presence.clone(),
+                    ),
+                );
+                if let Some(sharer_tx) = &session.sharer_tx {
+                    let _ = send_sharer_message(
+                        sharer_tx,
+                        sharer_protocol::DownstreamMessage::ParticipantPresenceUpdated(presence),
+                    );
+                }
+            }
+            viewer_protocol::UpstreamMessage::RequestRole(role) => {
+                handle_viewer_role_request(&state, session_id, &viewer_id, role, &out_tx).await;
+            }
+            viewer_protocol::UpstreamMessage::UpdateInput(update) => {
+                forward_viewer_input_update(&state, session_id, &viewer_id, update, &out_tx)
+                    .await;
+            }
+            viewer_protocol::UpstreamMessage::ExecuteCommand { buffer_id, command } => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                let id = CommandExecutionRequestId::new();
+                if viewer_can_execute(session, &viewer_id) {
+                    let participant_id = viewer_id.clone();
+                    if let Some(sharer_tx) = &session.sharer_tx {
+                        let _ = send_sharer_message(
+                            sharer_tx,
+                            sharer_protocol::DownstreamMessage::CommandExecutionRequested {
+                                id: id.clone(),
+                                participant_id,
+                                buffer_id,
+                                command,
+                            },
+                        );
+                    }
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::CommandExecutionRequestInFlight(id),
+                    );
+                } else {
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::CommandExecutionRequestFailed {
+                            id,
+                            reason: CommandExecutionFailureReason::InsufficientPermissions,
+                        },
+                    );
+                }
+            }
+            viewer_protocol::UpstreamMessage::WriteToPty { request_id, bytes } => {
+                let sessions = state.shared_sessions.read().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    break;
+                };
+                if viewer_can_execute(session, &viewer_id) {
+                    if let Some(sharer_tx) = &session.sharer_tx {
+                        let _ = send_sharer_message(
+                            sharer_tx,
+                            sharer_protocol::DownstreamMessage::WriteToPtyRequested {
+                                id: request_id,
+                                bytes,
+                            },
+                        );
+                    }
+                } else {
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::WriteToPtyRequestFailed {
+                            reason: WriteToPtyFailureReason::InsufficientPermissions,
+                        },
+                    );
+                }
+            }
+            viewer_protocol::UpstreamMessage::SendAgentPrompt(request) => {
+                let request_id = request.id.clone();
+                let sessions = state.shared_sessions.read().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    break;
+                };
+                if viewer_can_execute(session, &viewer_id) {
+                    if let Some(sharer_tx) = &session.sharer_tx {
+                        let _ = send_sharer_message(
+                            sharer_tx,
+                            sharer_protocol::DownstreamMessage::AgentPromptRequested {
+                                id: request_id.clone(),
+                                participant_id: viewer_id.clone(),
+                                request,
+                            },
+                        );
+                    }
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::AgentPromptRequestInFlight(
+                            request_id,
+                        ),
+                    );
+                } else {
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::AgentPromptRequestFailed {
+                            reason: session_sharing_protocol::common::AgentPromptFailureReason::InsufficientPermissions,
+                        },
+                    );
+                }
+            }
+            viewer_protocol::UpstreamMessage::SendControlAction(action) => {
+                let sessions = state.shared_sessions.read().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    break;
+                };
+                if viewer_can_execute(session, &viewer_id) {
+                    if let Some(sharer_tx) = &session.sharer_tx {
+                        let _ = send_sharer_message(
+                            sharer_tx,
+                            sharer_protocol::DownstreamMessage::ControlActionRequested {
+                                participant_id: viewer_id.clone(),
+                                request_id: ControlActionRequestId::new(),
+                                action,
+                            },
+                        );
+                    }
+                } else {
+                    let _ = send_viewer_message(
+                        &out_tx,
+                        viewer_protocol::DownstreamMessage::ControlActionRequestFailed {
+                            reason: ControlActionFailureReason::InsufficientPermissions,
+                        },
+                    );
+                }
+            }
+            viewer_protocol::UpstreamMessage::UpdateUniversalDeveloperInputContext(update) => {
+                let mut sessions = state.shared_sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    break;
+                };
+                let current = session
+                    .universal_developer_input_context
+                    .take()
+                    .unwrap_or_default();
+                session.universal_developer_input_context = Some(update.clone().merge_into(current));
+                if let Some(sharer_tx) = &session.sharer_tx {
+                    let _ = send_sharer_message(
+                        sharer_tx,
+                        sharer_protocol::DownstreamMessage::UniversalDeveloperInputContextUpdated(
+                            update.clone(),
+                        ),
+                    );
+                }
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::UniversalDeveloperInputContextUpdated(
+                        update,
+                    ),
+                );
+            }
+            viewer_protocol::UpstreamMessage::ReportTerminalSize { window_size } => {
+                let sessions = state.shared_sessions.read().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    break;
+                };
+                if let Some(sharer_tx) = &session.sharer_tx {
+                    let _ = send_sharer_message(
+                        sharer_tx,
+                        sharer_protocol::DownstreamMessage::ViewerTerminalSizeReported {
+                            participant_id: viewer_id.clone(),
+                            window_size,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut sessions = state.shared_sessions.write().await;
+    if let Some(session) = sessions.get_mut(&session_id) {
+        if session
+            .viewers
+            .get(&viewer_id)
+            .is_some_and(|viewer| viewer.tx.same_channel(&out_tx))
+        {
+            session.viewers.remove(&viewer_id);
+            let participant_list = participant_list(session);
+            fanout_participant_list(session, participant_list);
+        }
+    }
+}
+
+async fn handle_viewer_role_request(
+    state: &ServerState,
+    session_id: SessionId,
+    viewer_id: &ParticipantId,
+    role: Role,
+    out_tx: &mpsc::UnboundedSender<WsMessage>,
+) {
+    let mut sessions = state.shared_sessions.write().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return;
+    };
+    let can_take_control = !role.can_execute()
+        || session
+            .viewers
+            .iter()
+            .all(|(id, viewer)| id == viewer_id || !viewer.role.can_execute());
+
+    if can_take_control {
+        if let Some(viewer) = session.viewers.get_mut(viewer_id) {
+            viewer.role = role;
+        }
+        let participant_list = participant_list(session);
+        fanout_participant_list(session, participant_list);
+        let response = RoleRequestResponse::Approved { new_role: role };
+        let _ = send_viewer_message(
+            out_tx,
+            viewer_protocol::DownstreamMessage::RoleRequestResponse(response),
+        );
+        fanout_viewers(
+            session,
+            viewer_protocol::DownstreamMessage::ParticipantRoleChanged {
+                participant_id: viewer_id.clone(),
+                reason: RoleUpdatedReason::UpdatedBySharer,
+                role,
+            },
+        );
+    } else {
+        let _ = send_viewer_message(
+            out_tx,
+            viewer_protocol::DownstreamMessage::RoleRequestResponse(
+                RoleRequestResponse::Rejected {
+                    reason: RoleRequestRejectedReason::RejectedBySharer,
+                },
+            ),
+        );
+    }
+}
+
+async fn forward_viewer_input_update(
+    state: &ServerState,
+    session_id: SessionId,
+    viewer_id: &ParticipantId,
+    update: InputUpdate,
+    out_tx: &mpsc::UnboundedSender<WsMessage>,
+) {
+    let sessions = state.shared_sessions.read().await;
+    let Some(session) = sessions.get(&session_id) else {
+        return;
+    };
+    if !viewer_can_execute(session, viewer_id) {
+        let _ = send_viewer_message(
+            out_tx,
+            viewer_protocol::DownstreamMessage::InputUpdateRejected {
+                id: update.id,
+                reason: session_sharing_protocol::common::InputUpdateFailureReason::InsufficientPermissions,
+            },
+        );
+        return;
+    }
+    if let Some(sharer_tx) = &session.sharer_tx {
+        let _ = send_sharer_message(
+            sharer_tx,
+            sharer_protocol::DownstreamMessage::InputUpdated(update),
+        );
+    }
+}
+
+fn viewer_can_execute(session: &SharedSession, viewer_id: &ParticipantId) -> bool {
+    session
+        .viewers
+        .get(viewer_id)
+        .is_some_and(|viewer| viewer.role.can_execute())
+}
+
+fn events_after(
+    session: &SharedSession,
+    last_received_event_no: Option<usize>,
+) -> Vec<OrderedTerminalEvent> {
+    session
+        .events
+        .iter()
+        .filter(|(event_no, _)| last_received_event_no.map_or(true, |last| **event_no > last))
+        .map(|(_, event)| event.clone())
+        .collect()
+}
+
+fn participant_list(session: &SharedSession) -> ParticipantList {
+    let sharer_info = ParticipantInfo {
+        id: session.sharer_id.clone(),
+        profile_data: ProfileData {
+            firebase_uid: session.sharer_firebase_uid.clone(),
+            display_name: session.sharer_display_name.clone(),
+            photo_url: None,
+            email: None,
+            input_replica_id: session.input_replica_id.clone(),
+        },
+        selection: session.sharer_selection.clone(),
+    };
+
+    let viewers = session
+        .viewers
+        .iter()
+        .map(|(id, viewer)| Viewer {
+            info: viewer_info(id, viewer),
+            role: viewer.role,
+            is_present: true,
+        })
+        .collect::<Vec<_>>();
+    let present_viewers = session
+        .viewers
+        .iter()
+        .map(|(id, viewer)| PresentViewer {
+            info: viewer_info(id, viewer),
+            max_acl: viewer.role,
+        })
+        .collect::<Vec<_>>();
+
+    ParticipantList {
+        sharer: session_sharing_protocol::common::Sharer { info: sharer_info },
+        viewers,
+        present_viewers,
+        absent_viewers: Vec::<AbsentViewer>::new(),
+        guests: Vec::new(),
+        pending_guests: Vec::new(),
+    }
+}
+
+fn viewer_info(id: &ParticipantId, viewer: &ViewerState) -> ParticipantInfo {
+    ParticipantInfo {
+        id: id.clone(),
+        profile_data: ProfileData {
+            firebase_uid: viewer.firebase_uid.clone(),
+            display_name: viewer.display_name.clone(),
+            photo_url: None,
+            email: None,
+            input_replica_id: InputReplicaId::default(),
+        },
+        selection: viewer.selection.clone(),
+    }
+}
+
+fn fanout_participant_list(session: &SharedSession, participant_list: ParticipantList) {
+    fanout_viewers(
+        session,
+        viewer_protocol::DownstreamMessage::ParticipantListUpdated(participant_list.clone()),
+    );
+    if let Some(sharer_tx) = &session.sharer_tx {
+        let _ = send_sharer_message(
+            sharer_tx,
+            sharer_protocol::DownstreamMessage::ParticipantListUpdated(participant_list),
+        );
+    }
+}
+
+fn fanout_viewers(session: &SharedSession, message: viewer_protocol::DownstreamMessage) {
+    for viewer in session.viewers.values() {
+        let _ = send_viewer_message(&viewer.tx, message.clone());
+    }
+}
+
+fn send_sharer_message(
+    tx: &mpsc::UnboundedSender<WsMessage>,
+    message: sharer_protocol::DownstreamMessage,
+) -> Result<(), mpsc::error::SendError<WsMessage>> {
+    let text = message
+        .to_json()
+        .unwrap_or_else(|err| json!({ "error": err.to_string() }).to_string());
+    tx.send(WsMessage::Text(text.into()))
+}
+
+fn send_viewer_message(
+    tx: &mpsc::UnboundedSender<WsMessage>,
+    message: viewer_protocol::DownstreamMessage,
+) -> Result<(), mpsc::error::SendError<WsMessage>> {
+    let text = message
+        .to_json()
+        .unwrap_or_else(|err| json!({ "error": err.to_string() }).to_string());
+    tx.send(WsMessage::Text(text.into()))
 }
 
 async fn graphql_v2(
@@ -455,6 +1366,16 @@ async fn graphql_v2(
         "GetUserSettings" | "getUserSettings" => get_user_settings_response(),
         "GetFeatureModelChoices" | "getFeatureModelChoices" => get_feature_model_choices_response(),
         "SetUserIsOnboarded" | "setUserIsOnboarded" => set_user_is_onboarded_response(),
+        "GetRequestLimitInfo" | "getRequestLimitInfo" => get_request_limit_info_response(),
+        "ListAIConversationMetadata"
+        | "listAIConversationMetadata"
+        | "ListAIConversations"
+        | "listAIConversations" => list_ai_conversations_response(),
+        "UpdateAgentTask" | "updateAgentTask" => update_agent_task_response(),
+        "GetUpdatedCloudObjects" | "getUpdatedCloudObjects" => get_updated_cloud_objects_response(),
+        "GetWorkspacesMetadataForUser" | "getWorkspacesMetadataForUser" => {
+            get_workspaces_metadata_for_user_response()
+        }
         unknown => {
             log::warn!("OSS loopback received unsupported GraphQL operation: {unknown}");
             return (
@@ -1482,38 +2403,113 @@ fn thinking_blocks_text(value: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+#[derive(Default)]
+struct PendingOpenAiAssistantTurn {
+    request_id: Option<String>,
+    content: Vec<String>,
+    tool_calls: Vec<LocalToolCall>,
+}
+
+impl PendingOpenAiAssistantTurn {
+    fn is_empty(&self) -> bool {
+        self.content.is_empty() && self.tool_calls.is_empty()
+    }
+
+    fn accepts_request_id(&self, request_id: &str) -> bool {
+        self.request_id.as_deref().map_or(true, |existing| {
+            !request_id.is_empty() && existing == request_id
+        })
+    }
+
+    fn set_request_id_if_needed(&mut self, request_id: &str) {
+        if self.request_id.is_none() && !request_id.is_empty() {
+            self.request_id = Some(request_id.to_string());
+        }
+    }
+
+    fn push_content(&mut self, request_id: &str, content: &str, messages: &mut Vec<Value>) {
+        if !self.is_empty() && !self.accepts_request_id(request_id) {
+            self.flush(messages);
+        }
+        self.set_request_id_if_needed(request_id);
+        self.content.push(content.to_string());
+    }
+
+    fn push_tool_call(
+        &mut self,
+        request_id: &str,
+        tool_call: LocalToolCall,
+        messages: &mut Vec<Value>,
+    ) {
+        if !self.is_empty() && !self.accepts_request_id(request_id) {
+            self.flush(messages);
+        }
+        self.set_request_id_if_needed(request_id);
+        self.tool_calls.push(tool_call);
+    }
+
+    fn flush(&mut self, messages: &mut Vec<Value>) {
+        if self.is_empty() {
+            return;
+        }
+
+        let content = self.content.join("\n\n");
+        if self.tool_calls.is_empty() {
+            if !content.trim().is_empty() {
+                messages.push(openai_assistant_text_message(&content));
+            }
+        } else {
+            messages.push(openai_assistant_message(&LocalAssistantTurn {
+                content,
+                reasoning: String::new(),
+                tool_calls: std::mem::take(&mut self.tool_calls),
+            }));
+        }
+
+        self.request_id = None;
+        self.content.clear();
+    }
+}
+
 fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
     let mut messages = vec![openai_system_message()];
     let mut local_tool_call_ids = std::collections::HashSet::new();
     let mut local_tool_result_ids = std::collections::HashSet::new();
+    let mut pending_assistant = PendingOpenAiAssistantTurn::default();
 
     if let Some(task_context) = request.task_context.as_ref() {
         for task in &task_context.tasks {
             for message in &task.messages {
                 match message.message.as_ref() {
                     Some(maa::message::Message::UserQuery(query)) => {
+                        pending_assistant.flush(&mut messages);
                         if !query.query.trim().is_empty() {
                             messages.push(openai_user_message(&query.query));
                         }
                     }
                     Some(maa::message::Message::AgentOutput(output)) => {
                         if !output.text.trim().is_empty() {
-                            messages.push(openai_assistant_text_message(&output.text));
+                            pending_assistant.push_content(
+                                &message.request_id,
+                                &output.text,
+                                &mut messages,
+                            );
                         }
                     }
                     Some(maa::message::Message::ToolCall(tool_call)) => {
                         if let Some(local_tool_call) = local_tool_call_from_api(tool_call) {
                             local_tool_call_ids.insert(local_tool_call.id.clone());
-                            messages.push(openai_assistant_message(&LocalAssistantTurn {
-                                content: String::new(),
-                                reasoning: String::new(),
-                                tool_calls: vec![local_tool_call],
-                            }));
+                            pending_assistant.push_tool_call(
+                                &message.request_id,
+                                local_tool_call,
+                                &mut messages,
+                            );
                         }
                     }
                     Some(maa::message::Message::ToolCallResult(result))
                         if local_tool_call_ids.contains(&result.tool_call_id) =>
                     {
+                        pending_assistant.flush(&mut messages);
                         local_tool_result_ids.insert(result.tool_call_id.clone());
                         messages.push(openai_tool_result_message(&LocalToolResult {
                             tool_call_id: result.tool_call_id.clone(),
@@ -1526,6 +2522,7 @@ fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
             }
         }
     }
+    pending_assistant.flush(&mut messages);
 
     let mut added_current_tool_result = false;
     for result in current_tool_results_for_request(request) {
@@ -2727,6 +3724,106 @@ fn set_user_is_onboarded_response() -> Value {
     })
 }
 
+fn get_request_limit_info_response() -> Value {
+    json!({
+        "data": {
+            "user": {
+                "__typename": "UserOutput",
+                "user": {
+                    "workspaces": [],
+                    "requestLimitInfo": {
+                        "isUnlimited": true,
+                        "requestsUsedSinceLastRefresh": 0,
+                        "requestLimit": 1_000_000,
+                        "nextRefreshTime": "2099-01-01T00:00:00Z",
+                        "requestLimitRefreshDuration": "MONTHLY",
+                        "isUnlimitedVoice": true,
+                        "voiceRequestLimit": 1_000_000,
+                        "voiceRequestsUsedSinceLastRefresh": 0,
+                        "isUnlimitedCodebaseIndices": true,
+                        "maxCodebaseIndices": 1_000_000,
+                        "maxFilesPerRepo": 1_000_000,
+                        "embeddingGenerationBatchSize": 100,
+                    },
+                    "bonusGrants": [],
+                },
+            },
+        },
+    })
+}
+
+fn list_ai_conversations_response() -> Value {
+    json!({
+        "data": {
+            "listAIConversations": {
+                "__typename": "ListAIConversationsOutput",
+                "conversations": [],
+                "responseContext": response_context(),
+            },
+        },
+    })
+}
+
+fn update_agent_task_response() -> Value {
+    json!({
+        "data": {
+            "updateAgentTask": {
+                "__typename": "UpdateAgentTaskOutput",
+                "responseContext": response_context(),
+            },
+        },
+    })
+}
+
+fn get_updated_cloud_objects_response() -> Value {
+    json!({
+        "data": {
+            "updatedCloudObjects": {
+                "__typename": "UpdatedCloudObjectsOutput",
+                "actionHistories": [],
+                "deletedObjectUids": {
+                    "folderUids": [],
+                    "genericStringObjectUids": [],
+                    "notebookUids": [],
+                    "workflowUids": [],
+                },
+                "folders": [],
+                "genericStringObjects": [],
+                "mcpGallery": [],
+                "notebooks": [],
+                "responseContext": response_context(),
+                "userProfiles": [],
+                "workflows": [],
+            },
+        },
+    })
+}
+
+fn get_workspaces_metadata_for_user_response() -> Value {
+    json!({
+        "data": {
+            "user": {
+                "__typename": "UserOutput",
+                "user": {
+                    "workspaces": [],
+                    "experiments": [],
+                    "discoverableTeams": [],
+                },
+            },
+            "pricingInfo": {
+                "__typename": "PricingInfoOutput",
+                "pricingInfo": {
+                    "plans": [],
+                    "overages": {
+                        "pricePerRequestUsdCents": 0,
+                    },
+                    "addonCreditsOptions": [],
+                },
+            },
+        },
+    })
+}
+
 fn firebase_token_response(account: &LocalAccount) -> Value {
     json!({
         "expiresIn": TOKEN_TTL_SECONDS,
@@ -2978,6 +4075,49 @@ thinking_budget = 2048
         assert!(model
             .headers
             .contains(&("User-Agent".to_string(), "OpenAI/Go 3.22.0".to_string())));
+    }
+
+    #[test]
+    fn local_graphql_agent_stubs_return_success_payloads() {
+        let _: cynic::GraphQlResponse<warp_graphql::mutations::update_agent_task::UpdateAgentTask> =
+            serde_json::from_value(update_agent_task_response()).unwrap();
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::list_ai_conversations::ListAIConversationMetadata,
+        > = serde_json::from_value(list_ai_conversations_response()).unwrap();
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_request_limit_info::GetRequestLimitInfo,
+        > = serde_json::from_value(get_request_limit_info_response()).unwrap();
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_updated_cloud_objects::GetUpdatedCloudObjects,
+        > = serde_json::from_value(get_updated_cloud_objects_response()).unwrap();
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_workspaces_metadata_for_user::GetWorkspacesMetadataForUser,
+        > = serde_json::from_value(get_workspaces_metadata_for_user_response()).unwrap();
+
+        assert_eq!(
+            update_agent_task_response()["data"]["updateAgentTask"]["__typename"],
+            "UpdateAgentTaskOutput"
+        );
+        assert_eq!(
+            list_ai_conversations_response()["data"]["listAIConversations"]["conversations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            get_request_limit_info_response()["data"]["user"]["user"]["requestLimitInfo"]
+                ["isUnlimited"],
+            true
+        );
+        assert_eq!(
+            get_updated_cloud_objects_response()["data"]["updatedCloudObjects"]
+                ["deletedObjectUids"]["notebookUids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -3373,6 +4513,182 @@ thinking_budget = 2048
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_read");
         assert_eq!(messages[2]["content"], "notes.md:\nlocal notes");
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn openai_messages_coalesce_tool_calls_and_assistant_text_for_same_turn() {
+        let request = maa::Request {
+            task_context: Some(maa::request::TaskContext {
+                tasks: vec![maa::Task {
+                    id: "task-1".to_string(),
+                    description: "task".to_string(),
+                    dependencies: None,
+                    messages: vec![
+                        maa::Message {
+                            id: "m-user".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r-user".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::UserQuery(
+                                maa::message::UserQuery {
+                                    query: "inspect the files".to_string(),
+                                    context: None,
+                                    referenced_attachments: HashMap::new(),
+                                    mode: None,
+                                    intended_agent: Default::default(),
+                                },
+                            )),
+                        },
+                        maa::Message {
+                            id: "m-call-read".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r-agent".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::ToolCall(
+                                maa::message::ToolCall {
+                                    tool_call_id: "call_read".to_string(),
+                                    tool: Some(maa::message::tool_call::Tool::ReadFiles(
+                                        maa::message::tool_call::ReadFiles {
+                                            files: vec![
+                                                maa::message::tool_call::read_files::File {
+                                                    name: "notes.md".to_string(),
+                                                    line_ranges: Vec::new(),
+                                                },
+                                            ],
+                                        },
+                                    )),
+                                },
+                            )),
+                        },
+                        maa::Message {
+                            id: "m-call-bash".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r-agent".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::ToolCall(
+                                maa::message::ToolCall {
+                                    tool_call_id: "call_bash".to_string(),
+                                    tool: Some(maa::message::tool_call::Tool::RunShellCommand(
+                                        maa::message::tool_call::RunShellCommand {
+                                            command: "ls".to_string(),
+                                            is_read_only: true,
+                                            uses_pager: false,
+                                            citations: Vec::new(),
+                                            is_risky: false,
+                                            risk_category: 0,
+                                            wait_until_complete_value: None,
+                                        },
+                                    )),
+                                },
+                            )),
+                        },
+                        maa::Message {
+                            id: "m-output".to_string(),
+                            task_id: "task-1".to_string(),
+                            request_id: "r-agent".to_string(),
+                            timestamp: None,
+                            server_message_data: String::new(),
+                            citations: Vec::new(),
+                            message: Some(maa::message::Message::AgentOutput(
+                                maa::message::AgentOutput {
+                                    text: "Let me check that.".to_string(),
+                                },
+                            )),
+                        },
+                    ],
+                    summary: String::new(),
+                    server_data: String::new(),
+                }],
+            }),
+            input: Some(maa::request::Input {
+                context: None,
+                r#type: Some(maa::request::input::Type::UserInputs(
+                    maa::request::input::UserInputs {
+                        inputs: vec![
+                            maa::request::input::user_inputs::UserInput {
+                                input: Some(
+                                    maa::request::input::user_inputs::user_input::Input::ToolCallResult(
+                                        maa::request::input::ToolCallResult {
+                                            tool_call_id: "call_read".to_string(),
+                                            result: Some(
+                                                maa::request::input::tool_call_result::Result::ReadFiles(
+                                                    maa::ReadFilesResult {
+                                                        result: Some(
+                                                            maa::read_files_result::Result::AnyFilesSuccess(
+                                                                maa::read_files_result::AnyFilesSuccess {
+                                                                    files: vec![maa::AnyFileContent {
+                                                                        content: Some(
+                                                                            maa::any_file_content::Content::TextContent(
+                                                                                maa::FileContent {
+                                                                                    file_path: "notes.md".to_string(),
+                                                                                    content: "local notes".to_string(),
+                                                                                    line_range: None,
+                                                                                },
+                                                                            ),
+                                                                        ),
+                                                                    }],
+                                                                },
+                                                            ),
+                                                        ),
+                                                    },
+                                                ),
+                                            ),
+                                        },
+                                    ),
+                                ),
+                            },
+                            maa::request::input::user_inputs::UserInput {
+                                input: Some(
+                                    maa::request::input::user_inputs::user_input::Input::ToolCallResult(
+                                        maa::request::input::ToolCallResult {
+                                            tool_call_id: "call_bash".to_string(),
+                                            result: Some(
+                                                maa::request::input::tool_call_result::Result::RunShellCommand(
+                                                    maa::RunShellCommandResult {
+                                                        command: "ls".to_string(),
+                                                        output: String::new(),
+                                                        exit_code: 0,
+                                                        result: Some(
+                                                            maa::run_shell_command_result::Result::CommandFinished(
+                                                                maa::ShellCommandFinished {
+                                                                    command_id: "call_bash".to_string(),
+                                                                    output: "Command: ls\nExit code: 0\n\nnotes.md\n".to_string(),
+                                                                    exit_code: 0,
+                                                                },
+                                                            ),
+                                                        ),
+                                                    },
+                                                ),
+                                            ),
+                                        },
+                                    ),
+                                ),
+                            },
+                        ],
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let messages = openai_messages_for_request(&request);
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "Let me check that.");
+        assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_read");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call_bash");
     }
 
     #[allow(deprecated)]

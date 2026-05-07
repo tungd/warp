@@ -6,9 +6,9 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= $(HOME)/.cargo/bin/cargo
 PACKAGE := warp
 BIN_NAME := warp-oss
-APP_NAME := WarpOSS
-BUNDLE_ID := dev.warp.WarpOss
-LEGACY_APP_NAME := WarpOss
+APP_NAME := WarpSOLO
+BUNDLE_ID := dev.warp.WarpSOLO
+LEGACY_APP_NAMES := WarpOSS WarpOss
 
 CARGO_PROFILE ?= dev
 PROFILE_DIR := $(if $(filter dev,$(CARGO_PROFILE)),debug,$(if $(filter release,$(CARGO_PROFILE)),release,$(CARGO_PROFILE)))
@@ -25,7 +25,7 @@ ICON_FILE := $(ICON_NAME).icns
 
 INSTALL_DIR ?= $(HOME)/Applications
 INSTALLED_APP := $(INSTALL_DIR)/$(APP_NAME).app
-LEGACY_INSTALLED_APP := $(INSTALL_DIR)/$(LEGACY_APP_NAME).app
+LEGACY_INSTALLED_APPS := $(addsuffix .app,$(addprefix $(INSTALL_DIR)/,$(LEGACY_APP_NAMES)))
 OPEN_AFTER_INSTALL ?= 0
 ENTITLEMENTS ?= script/Debug-Entitlements.plist
 
@@ -40,8 +40,8 @@ help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make build               Build the warp-oss binary' \
-		'  make bundle              Build and sign WarpOSS.app' \
-		'  make install             Install WarpOSS.app to ~/Applications' \
+		'  make bundle              Build and sign WarpSOLO.app' \
+		'  make install             Install WarpSOLO.app to ~/Applications' \
 		'  make run                 Run warp-oss from cargo' \
 		'  make uninstall           Remove the installed local bundle' \
 		'  make signing-identities  List local codesigning identities' \
@@ -147,9 +147,11 @@ sign: build
 install: bundle
 	mkdir -p '$(INSTALL_DIR)'
 	rm -rf '$(INSTALLED_APP)'
-	@if [[ '$(LEGACY_INSTALLED_APP)' != '$(INSTALLED_APP)' ]]; then \
-		rm -rf '$(LEGACY_INSTALLED_APP)'; \
-	fi
+	@for app in $(LEGACY_INSTALLED_APPS); do \
+		if [[ "$$app" != '$(INSTALLED_APP)' ]]; then \
+			rm -rf "$$app"; \
+		fi; \
+	done
 	ditto '$(APP_PATH)' '$(INSTALLED_APP)'
 	@if [[ '$(OPEN_AFTER_INSTALL)' == 1 ]]; then \
 		open '$(INSTALLED_APP)'; \

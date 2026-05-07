@@ -16,8 +16,8 @@ fn main() -> Result<()> {
     let mut state = ChannelState::new(
         Channel::Oss,
         ChannelConfig {
-            app_id: AppId::new("dev", "warp", "WarpOss"),
-            logfile_name: "warp-oss.log".into(),
+            app_id: AppId::new("dev", "warp", "WarpSOLO"),
+            logfile_name: "warp-solo.log".into(),
             server_config: WarpServerConfig::production(),
             oz_config: OzConfig::production(),
             telemetry_config: None,
@@ -33,6 +33,12 @@ fn main() -> Result<()> {
 
     let _loopback_server = oss_loopback::LoopbackServer::spawn()?;
     ChannelState::override_server_root_url(_loopback_server.server_root_url().to_owned())?;
+    ChannelState::override_session_sharing_server_url(
+        _loopback_server.session_sharing_server_url(),
+    )?;
+    ChannelState::override_session_sharing_public_root_url(
+        _loopback_server.server_root_url().to_owned(),
+    )?;
 
     warp::run()
 }
@@ -47,15 +53,15 @@ embed_plist::embed_info_plist_bytes!(r#"
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleDisplayName</key>
-    <string>WarpOSS</string>
+    <string>WarpSOLO</string>
     <key>CFBundleExecutable</key>
     <string>warp-oss</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.warp.WarpOss</string>
+    <string>dev.warp.WarpSOLO</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>WarpOSS</string>
+    <string>WarpSOLO</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

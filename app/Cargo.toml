@@ -275,7 +275,7 @@ wgpu.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 app-installation-detection.workspace = true
 async-io.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 comfy-table = "7.1.4"
 inquire = "0.9.1"
 diesel = { workspace = true, features = ["sqlite", "chrono"] }
