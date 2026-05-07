@@ -47,7 +47,6 @@ impl LocalAgentRun {
 }
 
 #[derive(Debug)]
-#[cfg(test)]
 pub(crate) struct LocalCommandOutput {
     pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: String,

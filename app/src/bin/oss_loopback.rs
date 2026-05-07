@@ -8,7 +8,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
 use std::{process::Stdio, time::Instant};
 
 use anyhow::{Context, Result};
@@ -26,7 +25,6 @@ use axum::{
 use base64::{prelude::BASE64_URL_SAFE, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
-#[cfg(test)]
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -47,7 +45,6 @@ use tokio::{
     sync::{mpsc, RwLock},
 };
 use uuid::Uuid;
-#[cfg(test)]
 use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
@@ -57,8 +54,9 @@ mod agent_state;
 mod bonjour;
 #[path = "oss_loopback/state.rs"]
 mod state;
+#[path = "oss_loopback/worker.rs"]
+mod worker;
 
-#[cfg(test)]
 use agent_state::LocalCommandOutput;
 use agent_state::{
     LocalAgentRun, LocalAssistantTurn, LocalToolCall, LocalToolEvent, LocalToolResult,
@@ -66,21 +64,13 @@ use agent_state::{
 use state::{LocalAccount, LocalAgentWorkerConfig};
 
 const LOCAL_LLM_FILE: &str = "llm.toml";
-#[cfg(test)]
 const LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS: usize = 30;
-#[cfg(test)]
 const LOCAL_TOOL_DEFAULT_GREP_MATCHES: usize = 100;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES: usize = 64_000;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_COMMAND_TIMEOUT_SECS: usize = 120;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_GREP_BYTES: usize = 64_000;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_GREP_MATCHES: usize = 1_000;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_READ_BYTES: usize = 64_000;
-#[cfg(test)]
 const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
@@ -329,6 +319,7 @@ struct ServerState {
     discovered_workers: bonjour::DiscoveredWorkerStore,
     shared_sessions: SharedSessionStore,
     worker_config: Arc<LocalAgentWorkerConfig>,
+    worker_runs: worker::WorkerRunStore,
 }
 
 type SharedSessionStore = Arc<RwLock<HashMap<SessionId, SharedSession>>>;
@@ -386,6 +377,7 @@ impl LoopbackServer {
             discovered_workers: bonjour::new_discovered_worker_store(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             worker_config,
+            worker_runs: worker::new_worker_run_store(),
         };
 
         let std_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -460,6 +452,20 @@ impl LoopbackServer {
             let router = Router::new()
                 .route("/worker/health", get(worker_health))
                 .route("/worker/capabilities", get(worker_capabilities))
+                .route("/worker/runs", post(worker::create_worker_run))
+                .route("/worker/runs/{run_id}", get(worker::get_worker_run))
+                .route(
+                    "/worker/runs/{run_id}/events",
+                    get(worker::worker_run_events),
+                )
+                .route(
+                    "/worker/runs/{run_id}/followup",
+                    post(worker::followup_worker_run),
+                )
+                .route(
+                    "/worker/runs/{run_id}/cancel",
+                    post(worker::cancel_worker_run),
+                )
                 .with_state(state);
             runtime.spawn(async move {
                 let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -1500,6 +1506,49 @@ where
     }
 }
 
+async fn generate_worker_agent_output_with_progress<OnToolCall, OnToolResult>(
+    state: &ServerState,
+    prompt: &str,
+    workspace: &Path,
+    mut on_tool_call: OnToolCall,
+    mut on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
+{
+    let model = LocalLlmConfig::load()?.active_model()?;
+
+    match model.api_style.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => call_anthropic_compatible(&state.client, &model, prompt)
+            .await
+            .map(LocalAgentRun::from_output),
+        "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
+        | "gemini" | "openrouter" => {
+            call_openai_compatible_autonomous_with_progress(
+                &state.client,
+                &model,
+                openai_messages_from_prompt(prompt),
+                workspace,
+                &mut on_tool_call,
+                &mut on_tool_result,
+            )
+            .await
+        }
+        _ => {
+            call_openai_compatible_autonomous_with_progress(
+                &state.client,
+                &model,
+                openai_messages_from_prompt(prompt),
+                workspace,
+                &mut on_tool_call,
+                &mut on_tool_result,
+            )
+            .await
+        }
+    }
+}
+
 #[allow(deprecated)]
 fn workspace_for_request(request: &maa::Request) -> PathBuf {
     workspace_from_input_context(
@@ -1569,6 +1618,29 @@ where
     OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
     run_openai_agent_loop_with_progress(
+        messages,
+        workspace,
+        &model.reasoning_field_name,
+        |messages| call_openai_chat_completion(client, model, messages),
+        on_tool_call,
+        on_tool_result,
+    )
+    .await
+}
+
+async fn call_openai_compatible_autonomous_with_progress<OnToolCall, OnToolResult>(
+    client: &reqwest::Client,
+    model: &ResolvedLocalLlm,
+    messages: Vec<Value>,
+    workspace: &Path,
+    on_tool_call: OnToolCall,
+    on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
+{
+    run_openai_agent_loop_autonomous_with_progress(
         messages,
         workspace,
         &model.reasoning_field_name,
@@ -1832,7 +1904,6 @@ fn apply_configured_headers(
     Ok(request)
 }
 
-#[cfg(test)]
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     match tool_call.name.as_str() {
         "read_file" => execute_read_file_tool(tool_call, workspace),
@@ -1844,7 +1915,6 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
     }
 }
 
-#[cfg(test)]
 fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let path = tool_call
         .arguments
@@ -1876,7 +1946,6 @@ fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result
     })
 }
 
-#[cfg(test)]
 fn select_file_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, bool) {
     let mut selected = String::new();
     let mut lines_read = 0usize;
@@ -1900,7 +1969,6 @@ fn select_file_lines(content: &str, offset: usize, limit: Option<usize>) -> (Str
     (selected, was_truncated)
 }
 
-#[cfg(test)]
 fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let path = tool_call
         .arguments
@@ -1944,7 +2012,6 @@ fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Resul
     })
 }
 
-#[cfg(test)]
 fn execute_search_replace_tool(
     tool_call: &LocalToolCall,
     workspace: &Path,
@@ -1990,7 +2057,6 @@ fn execute_search_replace_tool(
     })
 }
 
-#[cfg(test)]
 fn execute_grep_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let pattern = tool_call
         .arguments
@@ -2069,7 +2135,6 @@ fn execute_grep_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loca
     })
 }
 
-#[cfg(test)]
 fn should_visit_grep_entry(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return true;
@@ -2080,7 +2145,6 @@ fn should_visit_grep_entry(entry: &DirEntry) -> bool {
     )
 }
 
-#[cfg(test)]
 fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
     match arguments.get(name) {
         None => Ok(None),
@@ -2093,7 +2157,6 @@ fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
     }
 }
 
-#[cfg(test)]
 fn execute_bash_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let command = tool_call
         .arguments
@@ -2115,7 +2178,6 @@ fn execute_bash_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loca
     })
 }
 
-#[cfg(test)]
 fn run_local_shell_command(
     workspace: &Path,
     command: &str,
@@ -2176,7 +2238,6 @@ fn run_local_shell_command(
     })
 }
 
-#[cfg(test)]
 fn read_capped_command_output(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let was_truncated = bytes.len() > LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES;
@@ -2192,7 +2253,6 @@ fn read_capped_command_output(path: &Path) -> Result<String> {
     Ok(output)
 }
 
-#[cfg(test)]
 fn format_command_output(command: &str, output: &LocalCommandOutput) -> String {
     let exit_code = output
         .exit_code
@@ -2219,7 +2279,6 @@ fn format_command_output(command: &str, output: &LocalCommandOutput) -> String {
     result
 }
 
-#[cfg(test)]
 fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
     let requested = Path::new(requested);
     if requested.is_absolute()
@@ -2535,7 +2594,6 @@ fn current_tool_results_for_request(request: &maa::Request) -> Vec<LocalToolResu
         .collect()
 }
 
-#[cfg(test)]
 fn openai_messages_from_prompt(prompt: &str) -> Vec<Value> {
     vec![openai_system_message(), openai_user_message(prompt)]
 }
@@ -2838,6 +2896,75 @@ where
         reasoning: turn.reasoning,
         tool_calls: turn.tool_calls,
         tool_events: Vec::new(),
+    })
+}
+
+async fn run_openai_agent_loop_autonomous_with_progress<F, Fut, OnToolCall, OnToolResult>(
+    mut messages: Vec<Value>,
+    workspace: &Path,
+    reasoning_field_name: &str,
+    mut complete: F,
+    mut on_tool_call: OnToolCall,
+    mut on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    F: FnMut(Vec<Value>) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
+{
+    const MAX_TOOL_ITERATIONS: usize = 8;
+
+    let mut output_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_events = Vec::new();
+
+    for _ in 0..=MAX_TOOL_ITERATIONS {
+        let response = complete(messages.clone()).await?;
+        let turn = parse_openai_assistant_turn(&response, reasoning_field_name)?;
+
+        if !turn.reasoning.trim().is_empty() {
+            reasoning_parts.push(turn.reasoning.clone());
+        }
+        if !turn.content.trim().is_empty() {
+            output_parts.push(turn.content.clone());
+        }
+
+        if turn.tool_calls.is_empty() {
+            return Ok(LocalAgentRun {
+                output: output_parts.join("\n\n"),
+                reasoning: reasoning_parts.join("\n\n"),
+                tool_calls: Vec::new(),
+                tool_events,
+            });
+        }
+
+        messages.push(openai_assistant_message(&turn));
+        for tool_call in turn.tool_calls {
+            on_tool_call(&tool_call);
+            let result = match execute_local_tool(&tool_call, workspace) {
+                Ok(result) => result,
+                Err(err) => LocalToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    content: format!("Tool failed: {err:#}"),
+                },
+            };
+            messages.push(openai_tool_result_message(&result));
+            let event = LocalToolEvent { tool_call, result };
+            on_tool_result(&event);
+            tool_events.push(event);
+        }
+    }
+
+    output_parts.push(format!(
+        "Stopped after {MAX_TOOL_ITERATIONS} tool iterations without a final answer."
+    ));
+    Ok(LocalAgentRun {
+        output: output_parts.join("\n\n"),
+        reasoning: reasoning_parts.join("\n\n"),
+        tool_calls: Vec::new(),
+        tool_events,
     })
 }
 
@@ -5127,6 +5254,76 @@ thinking_budget = 2048
             .iter()
             .any(|tool| { tool["type"] == "function" && tool["function"]["name"] == "read_file" }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn autonomous_openai_agent_loop_executes_tools_until_final_answer() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool_results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = run_openai_agent_loop_autonomous_with_progress(
+            openai_messages_from_prompt("What is in notes.md?"),
+            tempdir.path(),
+            "reasoning_content",
+            {
+                let calls = calls.clone();
+                move |_messages| {
+                    let call_index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Ok(match call_index {
+                            0 => json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "id": "call_read",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"notes.md\"}"
+                                            }
+                                        }]
+                                    }
+                                }]
+                            }),
+                            1 => json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "notes.md contains local notes."
+                                    }
+                                }]
+                            }),
+                            _ => panic!("agent loop called the model too many times"),
+                        })
+                    }
+                }
+            },
+            {
+                let tool_calls = tool_calls.clone();
+                move |tool_call| {
+                    tool_calls.lock().unwrap().push(tool_call.clone());
+                }
+            },
+            {
+                let tool_results = tool_results.clone();
+                move |event| {
+                    tool_results.lock().unwrap().push(event.clone());
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(run.output, "notes.md contains local notes.");
+        assert!(run.tool_calls.is_empty());
+        assert_eq!(run.tool_events.len(), 1);
+        assert_eq!(run.tool_events[0].result.content, "local notes");
+        assert_eq!(tool_calls.lock().unwrap().len(), 1);
+        assert_eq!(tool_results.lock().unwrap().len(), 1);
     }
 
     #[test]
