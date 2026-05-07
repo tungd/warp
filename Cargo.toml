@@ -145,6 +145,7 @@ futures = { version = "0.3", features = ["executor", "thread-pool"] }
 futures-lite = "1.13.0"
 futures-util = { version = "0.3", default-features = false }
 get-size = { version = "0.1.4", features = ["derive"] }
+genai = "=0.6.0-beta.18"
 globset = "0.4.18"
 gloo = { version = "0.11.0", default-features = false, features = [
   "events",

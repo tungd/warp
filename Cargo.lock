@@ -341,8 +341,8 @@ dependencies = [
  "streaming-iterator",
  "string-offset",
  "strsim 0.11.1",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "syntax_tree",
  "tempfile",
  "thiserror 2.0.17",
@@ -584,7 +584,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -1141,7 +1141,7 @@ dependencies = [
  "cfg-if",
  "futures",
  "log",
- "reqwest",
+ "reqwest 0.12.28",
  "url",
  "warpui_core",
 ]
@@ -2336,7 +2336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c6d47a4e2961fb8721bcfc54feae6455f2f64e7054f9bc67e875f0e77f4c58d"
 dependencies = [
  "rust_decimal",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "utf8-width",
 ]
@@ -3029,7 +3029,7 @@ dependencies = [
  "objc2-core-graphics",
  "pathfinder_geometry",
  "serde",
- "serde_with",
+ "serde_with 2.3.3",
  "tempfile",
  "tokio",
  "url",
@@ -3728,6 +3728,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
+dependencies = [
+ "darling_core 0.23.0",
+ "darling_macro 0.23.0",
+]
+
+[[package]]
 name = "darling_core"
 version = "0.20.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3756,6 +3766,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling_core"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
+dependencies = [
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim 0.11.1",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "darling_macro"
 version = "0.20.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3773,6 +3796,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
 dependencies = [
  "darling_core 0.21.3",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
+dependencies = [
+ "darling_core 0.23.0",
  "quote",
  "syn 2.0.117",
 ]
@@ -5316,6 +5350,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "genai"
+version = "0.6.0-beta.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c4cdcea8e154cc3b2a6dc4a965acc8523ce94e760320e33dbe9fe304cecba77"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "derive_more 2.0.1",
+ "eventsource-stream",
+ "futures",
+ "mime_guess",
+ "regex",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "serde_with 3.19.0",
+ "strum 0.28.0",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+ "value-ext",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6156,7 +6215,7 @@ dependencies = [
  "oauth2",
  "prevent_sleep",
  "prost 0.14.3",
- "reqwest",
+ "reqwest 0.12.28",
  "reqwest-eventsource",
  "serde",
  "serde_json",
@@ -6732,8 +6791,8 @@ dependencies = [
  "serde_json",
  "settings",
  "simplelog",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "sum_tree",
  "sysinfo",
  "version-compare",
@@ -7582,8 +7641,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "simple_logger",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "tokio",
  "url",
  "warp_core",
@@ -8605,7 +8664,7 @@ dependencies = [
  "getrandom 0.2.16",
  "http 1.1.0",
  "rand 0.8.6",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -9026,8 +9085,8 @@ dependencies = [
  "rust-embed 8.7.2",
  "serde",
  "serde_json",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "ui_components",
  "uuid",
  "warp_core",
@@ -10247,6 +10306,7 @@ version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
@@ -10766,8 +10826,8 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "tempfile",
  "thiserror 2.0.17",
  "virtual-fs",
@@ -10819,9 +10879,52 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.0",
  "web-sys",
  "webpki-roots 1.0.1",
+]
+
+[[package]]
+name = "reqwest"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "encoding_rs",
+ "futures-core",
+ "futures-util",
+ "h2 0.4.12",
+ "http 1.1.0",
+ "http-body 1.0.0",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls 0.23.39",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
+ "web-sys",
 ]
 
 [[package]]
@@ -10836,7 +10939,7 @@ dependencies = [
  "mime",
  "nom 7.1.3",
  "pin-project-lite",
- "reqwest",
+ "reqwest 0.12.28",
  "thiserror 1.0.63",
 ]
 
@@ -10933,9 +11036,9 @@ dependencies = [
  "pastey 0.2.1",
  "pin-project-lite",
  "process-wrap",
- "reqwest",
+ "reqwest 0.12.28",
  "rmcp-macros",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "sse-stream",
@@ -11385,6 +11488,18 @@ dependencies = [
 
 [[package]]
 name = "schemars"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82d20c4491bc164fa2f6c5d44565947a52ad80b9505d8e36f8d54c27c739fcd0"
@@ -11571,7 +11686,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "507ac2be9bf2da56c831da57faf1dadd81f434bd282935cdb06193d0c94e8811"
 dependencies = [
  "httpdate",
- "reqwest",
+ "reqwest 0.12.28",
  "rustls 0.23.39",
  "sentry-actix",
  "sentry-anyhow",
@@ -11871,7 +11986,26 @@ dependencies = [
  "indexmap 1.9.3",
  "serde",
  "serde_json",
- "serde_with_macros",
+ "serde_with_macros 2.3.3",
+ "time",
+]
+
+[[package]]
+name = "serde_with"
+version = "3.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05839ce67618e14a09b286535c0d9c94e85ef25469b0e13cb4f844e5593eb19"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "indexmap 1.9.3",
+ "indexmap 2.12.0",
+ "schemars 0.9.0",
+ "schemars 1.0.4",
+ "serde_core",
+ "serde_json",
+ "serde_with_macros 3.19.0",
  "time",
 ]
 
@@ -11882,6 +12016,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "881b6f881b17d13214e5d494c939ebab463d01264ce1811e9d4ac3a882e7695f"
 dependencies = [
  "darling 0.20.8",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_with_macros"
+version = "3.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
+dependencies = [
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -11958,7 +12104,7 @@ dependencies = [
  "concat-idents",
  "inventory",
  "log",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings_value",
@@ -11974,7 +12120,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "instant",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings_value_derive",
@@ -12485,6 +12631,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f64def088c51c9510a8579e3c5d67c65349dcf755e5479ad3d010aa6454e2c32"
 
 [[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
+
+[[package]]
 name = "strum_macros"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12494,6 +12649,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
  "syn 2.0.117",
 ]
 
@@ -14140,11 +14307,11 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.19.0"
+version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
+checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "js-sys",
  "serde_core",
  "wasm-bindgen",
@@ -14191,6 +14358,17 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
+
+[[package]]
+name = "value-ext"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05ebf9090a4eea10b1962958987cb54ee69f98b45eb918b73cb846bfb8c8c06f"
+dependencies = [
+ "derive_more 2.0.1",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "variant_count"
@@ -14438,6 +14616,7 @@ dependencies = [
  "futures-timer",
  "futures-util",
  "fuzzy_match",
+ "genai",
  "gethostname",
  "getrandom 0.2.16",
  "getset",
@@ -14519,13 +14698,13 @@ dependencies = [
  "regex-automata",
  "remote_server",
  "repo_metadata",
- "reqwest",
+ "reqwest 0.12.28",
  "reqwest-eventsource",
  "rmcp",
  "rquickjs",
  "rust-embed 8.7.2",
  "rustls 0.23.39",
- "schemars",
+ "schemars 1.0.4",
  "security-framework-sys",
  "sentry",
  "sentry-log",
@@ -14536,7 +14715,7 @@ dependencies = [
  "serde_json",
  "serde_regex",
  "serde_urlencoded",
- "serde_with",
+ "serde_with 2.3.3",
  "serde_yaml",
  "serial_test",
  "session-sharing-protocol",
@@ -14555,8 +14734,8 @@ dependencies = [
  "smol_str",
  "static_assertions",
  "string-offset",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "sum_tree",
  "syntax_tree",
  "syntect",
@@ -14638,7 +14817,7 @@ dependencies = [
  "rust-embed 6.8.1",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.3.3",
  "warp-completion-metadata",
 ]
 
@@ -14652,7 +14831,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.3.3",
 ]
 
 [[package]]
@@ -14768,20 +14947,20 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "regex",
- "reqwest",
- "schemars",
+ "reqwest 0.12.28",
+ "schemars 1.0.4",
  "sentry",
  "sentry-log",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.3.3",
  "serde_yaml",
  "settings",
  "settings_value",
  "shellexpand",
  "string-offset",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.17",
@@ -14886,7 +15065,7 @@ dependencies = [
  "instant",
  "log",
  "persistence",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "thiserror 2.0.17",
  "warp_core",
@@ -15027,7 +15206,7 @@ dependencies = [
  "log",
  "pathfinder_geometry",
  "persistence",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "session-sharing-protocol",
  "settings_value",
@@ -15277,7 +15456,7 @@ dependencies = [
  "rstar",
  "rust-embed 8.7.2",
  "rustc-hash 2.1.1",
- "schemars",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings_value",
@@ -15285,8 +15464,8 @@ dependencies = [
  "simplelog",
  "smallvec 1.15.1",
  "string-offset",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "sum_tree",
  "tempfile",
  "thiserror 2.0.17",
@@ -15440,6 +15619,19 @@ name = "wasm-streams"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b65dc4c90b63b118468cf747d8bf3566c1913ef60be765b5730ead9e0a3ba129"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",

@@ -48,6 +48,8 @@ use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
+#[path = "oss_loopback/agent_providers.rs"]
+mod agent_providers;
 #[path = "oss_loopback/agent_state.rs"]
 mod agent_state;
 #[path = "oss_loopback/bonjour.rs"]
@@ -229,7 +231,7 @@ impl LocalLlmAgentConfig {
         Some(
             self.enabled_tools
                 .iter()
-                .map(str::trim)
+                .map(|name| name.trim())
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
                 .collect(),
@@ -323,6 +325,7 @@ struct ResolvedLocalLlm {
     token: String,
     token_configured: bool,
     headers: Vec<(String, String)>,
+    #[allow(dead_code)]
     reasoning_field_name: String,
     thinking: String,
     thinking_budget: Option<u32>,
@@ -1539,43 +1542,17 @@ where
 {
     let model = LocalLlmConfig::load()?.active_model()?;
 
-    match model.api_style.trim().to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" => {
-            let prompt = extract_user_prompt(request)
-                .filter(|prompt| !prompt.trim().is_empty())
-                .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
-            call_anthropic_compatible(&state.client, &model, &prompt)
-                .await
-                .map(LocalAgentRun::from_output)
-        }
-        "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
-        | "gemini" | "openrouter" => {
-            let workspace = workspace_for_request(request);
-            let messages = openai_messages_for_request(request, &model);
-            call_openai_compatible_with_progress(
-                &state.client,
-                &model,
-                messages,
-                &workspace,
-                &mut on_tool_call,
-                &mut on_tool_result,
-            )
-            .await
-        }
-        _ => {
-            let workspace = workspace_for_request(request);
-            let messages = openai_messages_for_request(request, &model);
-            call_openai_compatible_with_progress(
-                &state.client,
-                &model,
-                messages,
-                &workspace,
-                &mut on_tool_call,
-                &mut on_tool_result,
-            )
-            .await
-        }
-    }
+    let workspace = workspace_for_request(request);
+    let messages = openai_messages_for_request(request, &model);
+    call_openai_compatible_with_progress(
+        &state.client,
+        &model,
+        messages,
+        &workspace,
+        &mut on_tool_call,
+        &mut on_tool_result,
+    )
+    .await
 }
 
 async fn generate_worker_agent_output_with_progress<OnToolCall, OnToolResult>(
@@ -1591,34 +1568,15 @@ where
 {
     let model = LocalLlmConfig::load()?.active_model()?;
 
-    match model.api_style.trim().to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" => call_anthropic_compatible(&state.client, &model, prompt)
-            .await
-            .map(LocalAgentRun::from_output),
-        "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
-        | "gemini" | "openrouter" => {
-            call_openai_compatible_autonomous_with_progress(
-                &state.client,
-                &model,
-                openai_messages_from_prompt(prompt, &model),
-                workspace,
-                &mut on_tool_call,
-                &mut on_tool_result,
-            )
-            .await
-        }
-        _ => {
-            call_openai_compatible_autonomous_with_progress(
-                &state.client,
-                &model,
-                openai_messages_from_prompt(prompt, &model),
-                workspace,
-                &mut on_tool_call,
-                &mut on_tool_result,
-            )
-            .await
-        }
-    }
+    call_openai_compatible_autonomous_with_progress(
+        &state.client,
+        &model,
+        openai_messages_from_prompt(prompt, &model),
+        workspace,
+        &mut on_tool_call,
+        &mut on_tool_result,
+    )
+    .await
 }
 
 #[allow(deprecated)]
@@ -1678,7 +1636,7 @@ async fn call_openai_compatible(
 }
 
 async fn call_openai_compatible_with_progress<OnToolCall, OnToolResult>(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
     workspace: &Path,
@@ -1689,11 +1647,10 @@ where
     OnToolCall: FnMut(&LocalToolCall) + Send,
     OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
-    run_openai_agent_loop_with_progress(
+    agent_providers::run_once_with_progress(
+        model,
         messages,
         workspace,
-        &model.reasoning_field_name,
-        |messages| call_openai_chat_completion(client, model, messages),
         on_tool_call,
         on_tool_result,
     )
@@ -1701,7 +1658,7 @@ where
 }
 
 async fn call_openai_compatible_autonomous_with_progress<OnToolCall, OnToolResult>(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
     workspace: &Path,
@@ -1712,17 +1669,17 @@ where
     OnToolCall: FnMut(&LocalToolCall) + Send,
     OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
-    run_openai_agent_loop_autonomous_with_progress(
+    agent_providers::run_autonomous_with_progress(
+        model,
         messages,
         workspace,
-        &model.reasoning_field_name,
-        |messages| call_openai_chat_completion(client, model, messages),
         on_tool_call,
         on_tool_result,
     )
     .await
 }
 
+#[allow(dead_code)]
 async fn call_openai_chat_completion(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
@@ -1748,6 +1705,7 @@ async fn call_openai_chat_completion(
     serde_json::from_str(&body).context("failed to parse local LLM response")
 }
 
+#[allow(dead_code)]
 fn openai_chat_completion_payload(model: &ResolvedLocalLlm, messages: Vec<Value>) -> Value {
     let mut payload = json!({
         "model": model.base_model_name,
@@ -1775,6 +1733,7 @@ fn thinking_enabled(thinking: &str) -> bool {
     !thinking.trim().is_empty() && !thinking.trim().eq_ignore_ascii_case("off")
 }
 
+#[allow(dead_code)]
 fn reasoning_effort(thinking: &str) -> &str {
     match thinking.trim().to_ascii_lowercase().as_str() {
         "low" => "low",
@@ -1847,6 +1806,7 @@ fn local_openai_tools(model: &ResolvedLocalLlm) -> Vec<Value> {
         .collect()
 }
 
+#[allow(dead_code)]
 async fn call_anthropic_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
@@ -1991,6 +1951,7 @@ fn local_tool_bash_parameters() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn completion_url(base_url: &str, endpoint: &str) -> String {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.ends_with(endpoint) {
@@ -2000,6 +1961,7 @@ fn completion_url(base_url: &str, endpoint: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn apply_configured_headers(
     mut request: reqwest::RequestBuilder,
     model: &ResolvedLocalLlm,
@@ -2398,6 +2360,7 @@ fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> 
     Ok(workspace.join(requested))
 }
 
+#[allow(dead_code)]
 fn parse_openai_assistant_turn(
     value: &Value,
     reasoning_field_name: &str,
@@ -2431,6 +2394,7 @@ fn parse_openai_assistant_turn(
     })
 }
 
+#[allow(dead_code)]
 fn parse_openai_tool_call((index, tool_call): (usize, &Value)) -> Result<LocalToolCall> {
     let function = tool_call
         .get("function")
@@ -2463,10 +2427,12 @@ fn parse_openai_tool_call((index, tool_call): (usize, &Value)) -> Result<LocalTo
     })
 }
 
+#[allow(dead_code)]
 fn extract_anthropic_text(value: &Value) -> Option<String> {
     value.get("content").and_then(text_value)
 }
 
+#[allow(dead_code)]
 fn text_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.to_owned()),
@@ -2486,6 +2452,7 @@ fn text_value(value: &Value) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn reasoning_text(message: &Value, field_name: &str) -> Option<String> {
     let primary = field_name.trim();
     let candidates = if primary.is_empty() || primary == "reasoning_content" {
@@ -2508,6 +2475,7 @@ fn reasoning_text(message: &Value, field_name: &str) -> Option<String> {
     message.get("content").and_then(thinking_blocks_text)
 }
 
+#[allow(dead_code)]
 fn thinking_blocks_text(value: &Value) -> Option<String> {
     let Value::Array(blocks) = value else {
         return None;
@@ -2978,6 +2946,7 @@ where
     .await
 }
 
+#[allow(dead_code)]
 async fn run_openai_agent_loop_with_progress<F, Fut, OnToolCall, OnToolResult>(
     messages: Vec<Value>,
     _workspace: &Path,
@@ -3006,6 +2975,7 @@ where
     })
 }
 
+#[allow(dead_code)]
 async fn run_openai_agent_loop_autonomous_with_progress<F, Fut, OnToolCall, OnToolResult>(
     mut messages: Vec<Value>,
     workspace: &Path,
@@ -3086,7 +3056,11 @@ Keep final answers concise and report what changed plus any verification result.
 fn local_agent_system_prompt(model: &ResolvedLocalLlm) -> String {
     let tool_names = local_openai_tools(model)
         .into_iter()
-        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .collect::<Vec<_>>();
     let tools = if tool_names.is_empty() {
         "no tools".to_string()
