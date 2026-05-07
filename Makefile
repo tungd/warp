@@ -43,6 +43,10 @@ ENTITLEMENTS ?= script/Debug-Entitlements.plist
 CODESIGN_IDENTITY ?= auto
 LLM_SOURCE_PATH ?=
 LLM_DEST_PATH ?= $(HOME)/.warp-oss/llm.toml
+LLM_SYNC_SYSTEM_PROMPT ?= 1
+MISTRAL_VIBE_ROOT ?= $(HOME)/Projects/personal/mistral-vibe
+LLM_SYSTEM_PROMPT_ID ?=
+LLM_SYSTEM_PROMPT_PATH ?=
 
 .PHONY: help print-config build build-universal bundle bundle-universal sign sign-universal prepare-bundle install install-universal install-bundle run uninstall signing-identities clean-bundle sync-llm-config
 
@@ -68,8 +72,12 @@ help:
 		'  BUNDLE_FEATURES=release_bundle|"<features>"' \
 		'  CODESIGN_IDENTITY=auto|"-"|"<identity>"' \
 		'  INSTALL_DIR=/Applications' \
+		'  LLM_SYNC_SYSTEM_PROMPT=0|1' \
 		'  LLM_SOURCE_PATH=/path/to/vibe-or-llm-config.toml' \
 		'  LLM_DEST_PATH=/path/to/.warp-oss/llm.toml' \
+		'  MISTRAL_VIBE_ROOT=/path/to/mistral-vibe' \
+		'  LLM_SYSTEM_PROMPT_ID=cli' \
+		'  LLM_SYSTEM_PROMPT_PATH=/path/to/system_prompt.md' \
 		'  OPEN_AFTER_INSTALL=1'
 
 print-config:
@@ -224,4 +232,8 @@ clean-bundle:
 sync-llm-config:
 	LLM_SOURCE_PATH="$(LLM_SOURCE_PATH)" \
 	LLM_DEST_PATH="$(LLM_DEST_PATH)" \
+	LLM_SYNC_SYSTEM_PROMPT="$(LLM_SYNC_SYSTEM_PROMPT)" \
+	MISTRAL_VIBE_ROOT="$(MISTRAL_VIBE_ROOT)" \
+	LLM_SYSTEM_PROMPT_ID="$(LLM_SYSTEM_PROMPT_ID)" \
+	LLM_SYSTEM_PROMPT_PATH="$(LLM_SYSTEM_PROMPT_PATH)" \
 	./script/sync-warp-oss-llm.sh
