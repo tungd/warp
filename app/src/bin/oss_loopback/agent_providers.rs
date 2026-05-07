@@ -3,21 +3,21 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use genai::{
-    Client, Headers, ModelIden, ServiceTarget,
     adapter::AdapterKind,
     chat::{
         ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
         ReasoningEffort, Tool, ToolCall, ToolResponse,
     },
     resolver::{AuthData, Endpoint},
+    Client, Headers, ModelIden, ServiceTarget,
 };
 use serde_json::Value;
 
 use super::{
-    ResolvedLocalLlm,
     agent_state::{
         LocalAgentRun, LocalAssistantTurn, LocalToolCall, LocalToolEvent, LocalToolResult,
     },
+    ResolvedLocalLlm,
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;

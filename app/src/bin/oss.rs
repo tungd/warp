@@ -31,16 +31,54 @@ fn main() -> Result<()> {
     }
     ChannelState::set(state);
 
-    let _loopback_server = oss_loopback::LoopbackServer::spawn()?;
-    ChannelState::override_server_root_url(_loopback_server.server_root_url().to_owned())?;
-    ChannelState::override_session_sharing_server_url(
-        _loopback_server.session_sharing_server_url(),
-    )?;
-    ChannelState::override_session_sharing_public_root_url(
-        _loopback_server.server_root_url().to_owned(),
-    )?;
+    let _loopback_server = if should_start_oss_loopback() {
+        let loopback_server = oss_loopback::LoopbackServer::spawn()?;
+        ChannelState::override_server_root_url(loopback_server.server_root_url().to_owned())?;
+        ChannelState::override_session_sharing_server_url(
+            loopback_server.session_sharing_server_url(),
+        )?;
+        ChannelState::override_session_sharing_public_root_url(
+            loopback_server.server_root_url().to_owned(),
+        )?;
+        Some(loopback_server)
+    } else {
+        None
+    };
 
     warp::run()
+}
+
+fn should_start_oss_loopback() -> bool {
+    let Some(command) = std::env::args().skip(1).find(|arg| !arg.starts_with('-')) else {
+        return true;
+    };
+
+    !is_worker_subcommand(&command)
+}
+
+fn is_worker_subcommand(command: &str) -> bool {
+    matches!(
+        command,
+        "installation-detection-server"
+            | "minidump-server"
+            | "plugin-host"
+            | "remote-server"
+            | "remote-server-proxy"
+            | "ripgrep-search"
+            | "terminal-server"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_worker_subcommand;
+
+    #[test]
+    fn detects_worker_subcommands() {
+        assert!(is_worker_subcommand("terminal-server"));
+        assert!(is_worker_subcommand("ripgrep-search"));
+        assert!(!is_worker_subcommand("warp://session/example"));
+    }
 }
 
 // If we're not using an external plist, embed the following as the Info.plist.

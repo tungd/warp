@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use super::{bonjour, ServerState};
+use super::{worker_discovery, ServerState};
 
 pub(crate) type CloudAgentRunStore = Arc<RwLock<HashMap<String, CloudAgentRunRecord>>>;
 
@@ -293,8 +293,9 @@ async fn spawn_agent_run(
         return Err(json_error(StatusCode::BAD_REQUEST, "prompt is required"));
     }
 
-    let worker_host = worker_host_from_config(request.config.as_ref());
-    let Some(worker) = bonjour::find_worker(&state.discovered_workers, &worker_host).await else {
+    let worker_host = worker_host_from_config(&state, request.config.as_ref()).await;
+    let Some(worker) = worker_discovery::find_worker(&state.discovered_workers, &worker_host).await
+    else {
         return Err(json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("no WarpSOLO worker is available for host '{worker_host}'"),
@@ -642,14 +643,45 @@ fn agent_config_snapshot_json(run: &CloudAgentRunRecord) -> Value {
     config
 }
 
-fn worker_host_from_config(config: Option<&Value>) -> String {
-    config
+async fn worker_host_from_config(state: &ServerState, config: Option<&Value>) -> String {
+    let configured_worker_host = config
         .and_then(|config| config.get("worker_host"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|host| !host.is_empty())
-        .unwrap_or("warp")
-        .to_string()
+        .unwrap_or("warp");
+
+    if !configured_worker_host.eq_ignore_ascii_case("warp") {
+        return configured_worker_host.to_string();
+    }
+
+    if let Some(environment_id) = environment_id_from_config(config) {
+        if let Some(worker) = worker_discovery::find_worker_by_synthetic_environment_id(
+            &state.discovered_workers,
+            environment_id,
+        )
+        .await
+        {
+            return worker.device_id;
+        }
+        if worker_discovery::is_synthetic_environment_id(environment_id) {
+            return environment_id.to_string();
+        }
+    }
+
+    configured_worker_host.to_string()
+}
+
+fn environment_id_from_config(config: Option<&Value>) -> Option<&str> {
+    config
+        .and_then(|config| {
+            config
+                .get("environment_id")
+                .or_else(|| config.get("environmentId"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|environment_id| !environment_id.is_empty())
 }
 
 fn model_id_from_config(config: Option<&Value>) -> Option<String> {
@@ -765,15 +797,38 @@ mod tests {
 
     #[test]
     fn worker_host_defaults_to_warp() {
-        assert_eq!(worker_host_from_config(None), "warp");
-        assert_eq!(worker_host_from_config(Some(&json!({}))), "warp");
+        assert_eq!(explicit_worker_host_from_config(None), "warp");
+        assert_eq!(explicit_worker_host_from_config(Some(&json!({}))), "warp");
     }
 
     #[test]
     fn worker_host_reads_config_value() {
         assert_eq!(
-            worker_host_from_config(Some(&json!({ "worker_host": "local-device-devbox" }))),
+            explicit_worker_host_from_config(Some(
+                &json!({ "worker_host": "local-device-devbox" })
+            )),
             "local-device-devbox"
+        );
+    }
+
+    fn explicit_worker_host_from_config(config: Option<&Value>) -> &str {
+        config
+            .and_then(|config| config.get("worker_host"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .unwrap_or("warp")
+    }
+
+    #[test]
+    fn environment_id_reads_snake_and_camel_case() {
+        assert_eq!(
+            environment_id_from_config(Some(&json!({ "environment_id": "wsolo-test" }))),
+            Some("wsolo-test")
+        );
+        assert_eq!(
+            environment_id_from_config(Some(&json!({ "environmentId": "wsolo-test" }))),
+            Some("wsolo-test")
         );
     }
 

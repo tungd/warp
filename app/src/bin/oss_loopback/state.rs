@@ -78,6 +78,17 @@ pub(crate) struct LocalAgentWorkerConfig {
     #[serde(default)]
     port: u16,
     pub(crate) pairing_token: Option<String>,
+    #[serde(default)]
+    pub(crate) peers: Vec<LocalAgentPeerConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct LocalAgentPeerConfig {
+    pub(crate) name: Option<String>,
+    pub(crate) device_id: Option<String>,
+    pub(crate) user_id: Option<String>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) url: String,
 }
 
 impl Default for LocalAgentWorkerConfig {
@@ -87,6 +98,7 @@ impl Default for LocalAgentWorkerConfig {
             bind: default_agent_worker_bind(),
             port: 0,
             pairing_token: None,
+            peers: Vec::new(),
         }
     }
 }
@@ -115,6 +127,10 @@ impl LocalAgentWorkerConfig {
         };
         SocketAddr::from_str(&format!("{bind}:{}", self.port))
             .with_context(|| format!("invalid agent worker bind address: {bind}:{}", self.port))
+    }
+
+    pub(crate) const fn port(&self) -> u16 {
+        self.port
     }
 }
 

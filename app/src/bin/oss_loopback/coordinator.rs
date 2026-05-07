@@ -8,10 +8,10 @@ use tokio::sync::mpsc;
 use warp_multi_agent_api as maa;
 
 use super::{
-    add_messages_event, agent_output_message, agent_reasoning_message, bonjour, create_task_action,
+    add_messages_event, agent_output_message, agent_reasoning_message, create_task_action,
     extract_user_prompt, finished_event, init_event, local_tool_call_message,
-    local_tool_result_message, send_response_event, stream_ids, task_info, workspace_for_request,
-    LocalToolCall, LocalToolEvent, LocalToolResult, ServerState,
+    local_tool_result_message, send_response_event, stream_ids, task_info, worker_discovery,
+    workspace_for_request, LocalToolCall, LocalToolEvent, LocalToolResult, ServerState,
 };
 
 const WORKER_DEFAULT_HARNESS: &str = "local-openai";
@@ -81,7 +81,7 @@ pub(crate) async fn try_proxy_multi_agent_to_worker(
         return false;
     };
     let Some(worker) =
-        bonjour::find_worker(&state.discovered_workers, &remote_request.worker_host).await
+        worker_discovery::find_worker(&state.discovered_workers, &remote_request.worker_host).await
     else {
         return false;
     };

@@ -51,16 +51,18 @@ use warp_multi_agent_api as maa;
 mod agent_providers;
 #[path = "oss_loopback/agent_state.rs"]
 mod agent_state;
-#[path = "oss_loopback/bonjour.rs"]
-mod bonjour;
 #[path = "oss_loopback/cloud_agent.rs"]
 mod cloud_agent;
 #[path = "oss_loopback/coordinator.rs"]
 mod coordinator;
+#[path = "oss_loopback/probe_discovery.rs"]
+mod probe_discovery;
 #[path = "oss_loopback/state.rs"]
 mod state;
 #[path = "oss_loopback/worker.rs"]
 mod worker;
+#[path = "oss_loopback/worker_discovery.rs"]
+mod worker_discovery;
 
 use agent_state::LocalCommandOutput;
 use agent_state::{
@@ -366,7 +368,9 @@ impl ResolvedLocalLlm {
     }
 
     fn configured_system_prompt(&self) -> Option<&str> {
-        self.system_prompt.as_deref().filter(|prompt| !prompt.trim().is_empty())
+        self.system_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
     }
 }
 
@@ -375,7 +379,7 @@ struct ServerState {
     account: Arc<LocalAccount>,
     client: reqwest::Client,
     cloud_agent_runs: cloud_agent::CloudAgentRunStore,
-    discovered_workers: bonjour::DiscoveredWorkerStore,
+    discovered_workers: worker_discovery::DiscoveredWorkerStore,
     shared_sessions: SharedSessionStore,
     worker_config: Arc<LocalAgentWorkerConfig>,
     worker_runs: worker::WorkerRunStore,
@@ -412,7 +416,6 @@ struct SharedSession {
 
 pub struct LoopbackServer {
     _runtime: Runtime,
-    _bonjour: Option<bonjour::BonjourRuntime>,
     server_root_url: String,
 }
 
@@ -434,11 +437,12 @@ impl LoopbackServer {
             account,
             client,
             cloud_agent_runs: cloud_agent::new_cloud_agent_run_store(),
-            discovered_workers: bonjour::new_discovered_worker_store(),
+            discovered_workers: worker_discovery::new_discovered_worker_store(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             worker_config,
             worker_runs: worker::new_worker_run_store(),
         };
+        worker_discovery::seed_static_workers(&state);
 
         let std_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .context("failed to bind OSS loopback server")?;
@@ -481,7 +485,10 @@ impl LoopbackServer {
             .route("/sessions/create", get(create_session_ws))
             .route("/sessions/join/{session_id}", get(join_session_ws))
             .route("/sessions/{session_id}/resume", get(resume_session_ws))
-            .route("/worker/discovered", get(bonjour::discovered_workers))
+            .route(
+                "/worker/discovered",
+                get(worker_discovery::discovered_workers),
+            )
             .with_state(state.clone());
 
         let worker_listener = if state.worker_config.enabled {
@@ -501,13 +508,7 @@ impl LoopbackServer {
             .map(|addr| addr);
         let worker_root_url = worker_addr.map(|addr| format!("http://{addr}"));
 
-        let bonjour = match bonjour::start(state.clone(), worker_addr) {
-            Ok(runtime) => Some(runtime),
-            Err(err) => {
-                log::warn!("WarpSOLO Bonjour discovery is disabled: {err:#}");
-                None
-            }
-        };
+        probe_discovery::start(state.clone(), &runtime);
 
         runtime.spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -563,7 +564,6 @@ impl LoopbackServer {
 
         Ok(Self {
             _runtime: runtime,
-            _bonjour: bonjour,
             server_root_url,
         })
     }
@@ -602,7 +602,7 @@ async fn worker_capabilities(State(state): State<ServerState>) -> Json<Value> {
         "deviceId": state.account.device_id,
         "displayName": state.account.display_name,
         "capabilities": ["agent", "terminal", "workspace"],
-        "auth": bonjour::worker_auth(&state.worker_config),
+        "auth": worker_discovery::worker_auth(&state.worker_config),
     }))
 }
 
@@ -1471,7 +1471,9 @@ async fn graphql_v2(
         | "ListAIConversations"
         | "listAIConversations" => list_ai_conversations_response(),
         "UpdateAgentTask" | "updateAgentTask" => update_agent_task_response(),
-        "GetUpdatedCloudObjects" | "getUpdatedCloudObjects" => get_updated_cloud_objects_response(),
+        "GetUpdatedCloudObjects" | "getUpdatedCloudObjects" => {
+            get_updated_cloud_objects_response(&state, &body).await
+        }
         "GetWorkspacesMetadataForUser" | "getWorkspacesMetadataForUser" => {
             get_workspaces_metadata_for_user_response()
         }
@@ -1504,7 +1506,7 @@ async fn multi_agent(State(state): State<ServerState>, body: Bytes) -> Response 
                     }]
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2676,7 +2678,9 @@ fn local_agent_system_prompt(model: &ResolvedLocalLlm) -> String {
     } else {
         tool_names.join(", ")
     };
-    let configured = model.configured_system_prompt().unwrap_or(DEFAULT_LOCAL_AGENT_SYSTEM_PROMPT);
+    let configured = model
+        .configured_system_prompt()
+        .unwrap_or(DEFAULT_LOCAL_AGENT_SYSTEM_PROMPT);
     if configured.contains("{tools}") {
         configured.replace("{tools}", &tools)
     } else {
@@ -3579,7 +3583,42 @@ fn update_agent_task_response() -> Value {
     })
 }
 
-fn get_updated_cloud_objects_response() -> Value {
+async fn get_updated_cloud_objects_response(state: &ServerState, request_body: &Value) -> Value {
+    let workers = state
+        .discovered_workers
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    get_updated_cloud_objects_response_for_workers(
+        &state.account,
+        &workers,
+        requested_generic_string_object_uids(request_body),
+    )
+}
+
+fn get_updated_cloud_objects_response_for_workers(
+    account: &LocalAccount,
+    workers: &[worker_discovery::DiscoveredWorker],
+    requested_generic_string_object_uids: Vec<String>,
+) -> Value {
+    let current_environment_ids = workers
+        .iter()
+        .map(worker_discovery::synthetic_environment_id_for_worker)
+        .collect::<HashSet<_>>();
+    let deleted_generic_string_object_uids = requested_generic_string_object_uids
+        .into_iter()
+        .filter(|uid| {
+            worker_discovery::is_synthetic_environment_id(uid)
+                && !current_environment_ids.contains(uid)
+        })
+        .collect::<Vec<_>>();
+    let generic_string_objects = workers
+        .iter()
+        .map(|worker| synthetic_peer_environment_object(account, worker))
+        .collect::<Vec<_>>();
+
     json!({
         "data": {
             "updatedCloudObjects": {
@@ -3587,12 +3626,12 @@ fn get_updated_cloud_objects_response() -> Value {
                 "actionHistories": [],
                 "deletedObjectUids": {
                     "folderUids": [],
-                    "genericStringObjectUids": [],
+                    "genericStringObjectUids": deleted_generic_string_object_uids,
                     "notebookUids": [],
                     "workflowUids": [],
                 },
                 "folders": [],
-                "genericStringObjects": [],
+                "genericStringObjects": generic_string_objects,
                 "mcpGallery": [],
                 "notebooks": [],
                 "responseContext": response_context(),
@@ -3601,6 +3640,82 @@ fn get_updated_cloud_objects_response() -> Value {
             },
         },
     })
+}
+
+fn synthetic_peer_environment_object(
+    account: &LocalAccount,
+    worker: &worker_discovery::DiscoveredWorker,
+) -> Value {
+    let environment_id = worker_discovery::synthetic_environment_id_for_worker(worker);
+    let owner_uid = stable_server_id("wuser-", &account.user_id);
+    let now = chrono::Utc::now().to_rfc3339();
+    let serialized_model = json!({
+        "name": worker.display_name,
+        "description": format!("WarpSOLO peer at {}", worker.url),
+        "github_repos": [],
+        "docker_image": "warpsolo/peer",
+        "setup_commands": [],
+    })
+    .to_string();
+
+    json!({
+        "__typename": "GenericStringObject",
+        "format": "JsonCloudEnvironment",
+        "metadata": {
+            "__typename": "ObjectMetadata",
+            "creatorUid": null,
+            "currentEditorUid": null,
+            "isWelcomeObject": false,
+            "lastEditorUid": null,
+            "metadataLastUpdatedTs": now,
+            "parent": {
+                "__typename": "Space",
+                "uid": owner_uid,
+                "type": "User",
+            },
+            "revisionTs": now,
+            "trashedTs": null,
+            "uid": environment_id,
+        },
+        "permissions": {
+            "__typename": "ObjectPermissions",
+            "guests": [],
+            "lastUpdatedTs": now,
+            "anyoneLinkSharing": null,
+            "space": {
+                "__typename": "Space",
+                "uid": owner_uid,
+                "type": "User",
+            },
+        },
+        "serializedModel": serialized_model,
+    })
+}
+
+fn stable_server_id(prefix: &str, value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut id = format!("{prefix}{hash:016x}");
+    id.truncate(22);
+    while id.len() < 22 {
+        id.push('0');
+    }
+    id
+}
+
+fn requested_generic_string_object_uids(request_body: &Value) -> Vec<String> {
+    request_body
+        .pointer("/variables/input/genericStringObjects")
+        .or_else(|| request_body.pointer("/input/genericStringObjects"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("uid").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn get_workspaces_metadata_for_user_response() -> Value {
@@ -3802,7 +3917,14 @@ fn resolve_agent_path(path: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn test_openai_model(name: &str) -> ResolvedLocalLlm {
         ResolvedLocalLlm {
@@ -3820,6 +3942,31 @@ mod tests {
             description: None,
             system_prompt: None,
             enabled_tools: None,
+        }
+    }
+
+    fn test_account() -> LocalAccount {
+        LocalAccount {
+            user_id: "local-user-test".to_string(),
+            device_id: "local-device-test".to_string(),
+            display_name: "test@localhost".to_string(),
+            id_token: "id-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            custom_token: "custom-token".to_string(),
+        }
+    }
+
+    fn test_worker(device_id: &str) -> worker_discovery::DiscoveredWorker {
+        worker_discovery::DiscoveredWorker {
+            source_id: format!("test:{device_id}"),
+            device_id: device_id.to_string(),
+            user_id: "local-user-peer".to_string(),
+            display_name: "peer@example.local".to_string(),
+            hostname: "example.local.".to_string(),
+            url: "http://192.168.1.10:9109".to_string(),
+            capabilities: vec!["agent".to_string()],
+            auth: "none".to_string(),
+            last_seen_epoch_millis: 1,
         }
     }
 
@@ -3877,7 +4024,12 @@ thinking_budget = 2048
         > = serde_json::from_value(get_request_limit_info_response()).unwrap();
         let _: cynic::GraphQlResponse<
             warp_graphql::queries::get_updated_cloud_objects::GetUpdatedCloudObjects,
-        > = serde_json::from_value(get_updated_cloud_objects_response()).unwrap();
+        > = serde_json::from_value(get_updated_cloud_objects_response_for_workers(
+            &test_account(),
+            &[],
+            Vec::new(),
+        ))
+        .unwrap();
         let _: cynic::GraphQlResponse<
             warp_graphql::queries::get_workspaces_metadata_for_user::GetWorkspacesMetadataForUser,
         > = serde_json::from_value(get_workspaces_metadata_for_user_response()).unwrap();
@@ -3899,12 +4051,54 @@ thinking_budget = 2048
             true
         );
         assert_eq!(
-            get_updated_cloud_objects_response()["data"]["updatedCloudObjects"]
-                ["deletedObjectUids"]["notebookUids"]
+            get_updated_cloud_objects_response_for_workers(&test_account(), &[], Vec::new())
+                ["data"]["updatedCloudObjects"]["deletedObjectUids"]["notebookUids"]
                 .as_array()
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn synthetic_peer_environments_parse_as_cloud_objects() {
+        let account = test_account();
+        let workers = vec![test_worker("local-device-peer")];
+        let response = get_updated_cloud_objects_response_for_workers(&account, &workers, vec![]);
+
+        let _: cynic::GraphQlResponse<
+            warp_graphql::queries::get_updated_cloud_objects::GetUpdatedCloudObjects,
+        > = serde_json::from_value(response.clone()).unwrap();
+
+        let env = &response["data"]["updatedCloudObjects"]["genericStringObjects"][0];
+        assert_eq!(env["format"], "JsonCloudEnvironment");
+        assert_eq!(
+            env["metadata"]["uid"]
+                .as_str()
+                .expect("synthetic environment id")
+                .len(),
+            22
+        );
+        assert!(env["serializedModel"]
+            .as_str()
+            .expect("serialized model")
+            .contains("peer@example.local"));
+    }
+
+    #[test]
+    fn stale_synthetic_peer_environments_are_deleted() {
+        let account = test_account();
+        let stale_uid =
+            worker_discovery::synthetic_environment_id_for_worker(&test_worker("stale-peer"));
+        let response = get_updated_cloud_objects_response_for_workers(
+            &account,
+            &[],
+            vec![stale_uid.clone(), "non-warpsolo-object".to_string()],
+        );
+
+        assert_eq!(
+            response["data"]["updatedCloudObjects"]["deletedObjectUids"]["genericStringObjectUids"],
+            json!([stale_uid])
         );
     }
 
@@ -3921,6 +4115,7 @@ thinking_budget = 2048
 
     #[test]
     fn resolves_tilde_agent_prompt_path_relative_to_home() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempfile::tempdir().unwrap();
         let prompt = tempdir.path().join("local_prompt.txt");
         fs::write(&prompt, "custom prompt").unwrap();
@@ -3930,7 +4125,10 @@ thinking_budget = 2048
         std::env::set_var("HOME", &home);
         let path = resolve_agent_path("~/local_prompt.txt").unwrap();
         assert_eq!(path, prompt);
-        assert_eq!(resolve_agent_system_prompt("~/local_prompt.txt").unwrap(), "custom prompt");
+        assert_eq!(
+            resolve_agent_system_prompt("~/local_prompt.txt").unwrap(),
+            "custom prompt"
+        );
 
         if let Some(previous_home) = previous_home {
             std::env::set_var("HOME", previous_home);
@@ -3941,6 +4139,7 @@ thinking_budget = 2048
 
     #[test]
     fn resolves_agent_prompt_path_relative_to_config_dir() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempfile::tempdir().unwrap();
         let home = tempdir.path();
         let config_dir = home.join(".warp-oss");
@@ -3992,11 +4191,18 @@ provider = "dashscope"
         let prompt = local_agent_system_prompt(&model);
         let tools = local_openai_tools(&model)
             .into_iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(tools, vec!["read_file", "grep"]);
-        assert_eq!(model.configured_system_prompt(), Some("Use only requested tools: {tools}"));
+        assert_eq!(
+            model.configured_system_prompt(),
+            Some("Use only requested tools: {tools}")
+        );
         assert_eq!(prompt, "Use only requested tools: read_file, grep");
     }
 

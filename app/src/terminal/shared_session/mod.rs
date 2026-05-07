@@ -302,7 +302,11 @@ pub fn join_native_intent(session_id: &SessionId) -> String {
 /// Returns the link to join a shared session.
 pub fn join_link(session_id: &SessionId) -> String {
     if let Some(public_root_url) = ChannelState::session_sharing_public_root_url() {
-        return format!("{}/session/{}", public_root_url.trim_end_matches('/'), session_id);
+        return format!(
+            "{}/session/{}",
+            public_root_url.trim_end_matches('/'),
+            session_id
+        );
     }
 
     // For non-bundled builds against the staging server, use the native app intent

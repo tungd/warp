@@ -147,7 +147,6 @@ markdown_parser.workspace = true
 memchr.workspace = true
 memo-map.workspace = true
 mermaid_to_svg.workspace = true
-mdns-sd.workspace = true
 num-traits.workspace = true
 num_cpus = "1.13.0"
 oauth2.workspace = true
