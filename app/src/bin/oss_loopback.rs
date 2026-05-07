@@ -4,10 +4,12 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::{process::Stdio, time::Instant};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -20,24 +22,33 @@ use axum::{
 };
 use base64::{prelude::BASE64_URL_SAFE, Engine as _};
 use prost::Message as _;
+#[cfg(test)]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{runtime::Runtime, sync::mpsc};
 use uuid::Uuid;
+#[cfg(test)]
 use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
 const LOCAL_LLM_FILE: &str = "llm.toml";
-const LOCAL_AGENT_MAX_TURNS: usize = 8;
+#[cfg(test)]
 const LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS: usize = 30;
+#[cfg(test)]
 const LOCAL_TOOL_DEFAULT_GREP_MATCHES: usize = 100;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES: usize = 64_000;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_COMMAND_TIMEOUT_SECS: usize = 120;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_GREP_BYTES: usize = 64_000;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_GREP_MATCHES: usize = 1_000;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_READ_BYTES: usize = 64_000;
+#[cfg(test)]
 const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
 
@@ -863,6 +874,7 @@ struct LocalToolEvent {
 #[derive(Clone, Debug, PartialEq)]
 struct LocalAgentRun {
     output: String,
+    tool_calls: Vec<LocalToolCall>,
     tool_events: Vec<LocalToolEvent>,
 }
 
@@ -870,11 +882,13 @@ impl LocalAgentRun {
     fn from_output(output: String) -> Self {
         Self {
             output,
+            tool_calls: Vec::new(),
             tool_events: Vec::new(),
         }
     }
 }
 
+#[cfg(test)]
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     match tool_call.name.as_str() {
         "read_file" => execute_read_file_tool(tool_call, workspace),
@@ -886,6 +900,7 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
     }
 }
 
+#[cfg(test)]
 fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let path = tool_call
         .arguments
@@ -917,6 +932,7 @@ fn execute_read_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result
     })
 }
 
+#[cfg(test)]
 fn select_file_lines(content: &str, offset: usize, limit: Option<usize>) -> (String, bool) {
     let mut selected = String::new();
     let mut lines_read = 0usize;
@@ -940,6 +956,7 @@ fn select_file_lines(content: &str, offset: usize, limit: Option<usize>) -> (Str
     (selected, was_truncated)
 }
 
+#[cfg(test)]
 fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let path = tool_call
         .arguments
@@ -983,6 +1000,7 @@ fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Resul
     })
 }
 
+#[cfg(test)]
 fn execute_search_replace_tool(
     tool_call: &LocalToolCall,
     workspace: &Path,
@@ -1028,6 +1046,7 @@ fn execute_search_replace_tool(
     })
 }
 
+#[cfg(test)]
 fn execute_grep_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let pattern = tool_call
         .arguments
@@ -1106,6 +1125,7 @@ fn execute_grep_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loca
     })
 }
 
+#[cfg(test)]
 fn should_visit_grep_entry(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return true;
@@ -1116,6 +1136,7 @@ fn should_visit_grep_entry(entry: &DirEntry) -> bool {
     )
 }
 
+#[cfg(test)]
 fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
     match arguments.get(name) {
         None => Ok(None),
@@ -1128,6 +1149,7 @@ fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
     }
 }
 
+#[cfg(test)]
 struct LocalCommandOutput {
     exit_code: Option<i32>,
     stdout: String,
@@ -1135,6 +1157,7 @@ struct LocalCommandOutput {
     timed_out: bool,
 }
 
+#[cfg(test)]
 fn execute_bash_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     let command = tool_call
         .arguments
@@ -1156,6 +1179,7 @@ fn execute_bash_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loca
     })
 }
 
+#[cfg(test)]
 fn run_local_shell_command(
     workspace: &Path,
     command: &str,
@@ -1216,6 +1240,7 @@ fn run_local_shell_command(
     })
 }
 
+#[cfg(test)]
 fn read_capped_command_output(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let was_truncated = bytes.len() > LOCAL_TOOL_MAX_COMMAND_OUTPUT_BYTES;
@@ -1231,6 +1256,7 @@ fn read_capped_command_output(path: &Path) -> Result<String> {
     Ok(output)
 }
 
+#[cfg(test)]
 fn format_command_output(command: &str, output: &LocalCommandOutput) -> String {
     let exit_code = output
         .exit_code
@@ -1257,6 +1283,7 @@ fn format_command_output(command: &str, output: &LocalCommandOutput) -> String {
     result
 }
 
+#[cfg(test)]
 fn resolve_workspace_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
     let requested = Path::new(requested);
     if requested.is_absolute()
@@ -1355,6 +1382,7 @@ fn text_value(value: &Value) -> Option<String> {
 fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
     let mut messages = vec![openai_system_message()];
     let mut local_tool_call_ids = std::collections::HashSet::new();
+    let mut local_tool_result_ids = std::collections::HashSet::new();
 
     if let Some(task_context) = request.task_context.as_ref() {
         for task in &task_context.tasks {
@@ -1382,6 +1410,7 @@ fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
                     Some(maa::message::Message::ToolCallResult(result))
                         if local_tool_call_ids.contains(&result.tool_call_id) =>
                     {
+                        local_tool_result_ids.insert(result.tool_call_id.clone());
                         messages.push(openai_tool_result_message(&LocalToolResult {
                             tool_call_id: result.tool_call_id.clone(),
                             name: "tool".to_string(),
@@ -1394,11 +1423,50 @@ fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
         }
     }
 
-    let prompt = extract_user_prompt(request)
-        .filter(|prompt| !prompt.trim().is_empty())
-        .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
-    messages.push(openai_user_message(&prompt));
+    let mut added_current_tool_result = false;
+    for result in current_tool_results_for_request(request) {
+        if local_tool_call_ids.contains(&result.tool_call_id)
+            && local_tool_result_ids.insert(result.tool_call_id.clone())
+        {
+            messages.push(openai_tool_result_message(&result));
+            added_current_tool_result = true;
+        }
+    }
+
+    if let Some(prompt) = extract_user_prompt(request).filter(|prompt| !prompt.trim().is_empty()) {
+        messages.push(openai_user_message(&prompt));
+    } else if !added_current_tool_result {
+        messages.push(openai_user_message(
+            "Continue the current Warp agent conversation.",
+        ));
+    }
     messages
+}
+
+#[allow(deprecated)]
+fn current_tool_results_for_request(request: &maa::Request) -> Vec<LocalToolResult> {
+    use maa::request::input::user_inputs::user_input::Input as UserInput;
+    use maa::request::input::Type;
+
+    let Some(input) = request.input.as_ref() else {
+        return Vec::new();
+    };
+    let Some(Type::UserInputs(inputs)) = input.r#type.as_ref() else {
+        return Vec::new();
+    };
+
+    inputs
+        .inputs
+        .iter()
+        .filter_map(|input| match input.input.as_ref()? {
+            UserInput::ToolCallResult(result) => Some(LocalToolResult {
+                tool_call_id: result.tool_call_id.clone(),
+                name: "tool".to_string(),
+                content: request_tool_result_text(result),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1492,61 +1560,121 @@ fn local_tool_call_from_api(tool_call: &maa::message::ToolCall) -> Option<LocalT
 fn api_tool_result_text(result: &maa::message::ToolCallResult) -> String {
     match result.result.as_ref() {
         Some(maa::message::tool_call_result::Result::RunShellCommand(result)) => {
-            match result.result.as_ref() {
-                Some(maa::run_shell_command_result::Result::CommandFinished(finished)) => format!(
-                    "Command: {}\nExit code: {}\n\n{}",
-                    result.command,
-                    finished.exit_code,
-                    strip_local_command_header(&finished.output)
-                ),
-                _ => format!("Command result for {} is unavailable.", result.command),
-            }
+            run_shell_command_result_text(result)
         }
         Some(maa::message::tool_call_result::Result::ReadFiles(result)) => {
-            match result.result.as_ref() {
-                Some(maa::read_files_result::Result::TextFilesSuccess(success)) => success
-                    .files
-                    .iter()
-                    .map(|file| format!("{}:\n{}", file.file_path, file.content))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                Some(maa::read_files_result::Result::AnyFilesSuccess(success)) => {
-                    format!("Read {} file(s).", success.files.len())
-                }
-                Some(maa::read_files_result::Result::Error(error)) => error.message.clone(),
-                None => "Read file result is unavailable.".to_string(),
-            }
+            read_files_result_text(result)
         }
-        Some(maa::message::tool_call_result::Result::Grep(result)) => {
-            match result.result.as_ref() {
-                Some(maa::grep_result::Result::Success(success)) => success
-                    .matched_files
-                    .iter()
-                    .map(|file| {
-                        let lines = file
-                            .matched_lines
-                            .iter()
-                            .map(|line| line.line_number.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("{}: {}", file.file_path, lines)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                Some(maa::grep_result::Result::Error(error)) => error.message.clone(),
-                None => "Grep result is unavailable.".to_string(),
-            }
-        }
+        Some(maa::message::tool_call_result::Result::Grep(result)) => grep_result_text(result),
         Some(maa::message::tool_call_result::Result::ApplyFileDiffs(result)) => {
-            match result.result.as_ref() {
-                Some(maa::apply_file_diffs_result::Result::Success(success)) => {
-                    apply_file_diffs_result_text(success)
-                }
-                Some(maa::apply_file_diffs_result::Result::Error(error)) => error.message.clone(),
-                None => "File edit result is unavailable.".to_string(),
-            }
+            apply_file_diffs_tool_result_text(result)
         }
         _ => "Tool result is unavailable.".to_string(),
+    }
+}
+
+#[allow(deprecated)]
+fn request_tool_result_text(result: &maa::request::input::ToolCallResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::request::input::tool_call_result::Result::RunShellCommand(result)) => {
+            run_shell_command_result_text(result)
+        }
+        Some(maa::request::input::tool_call_result::Result::ReadFiles(result)) => {
+            read_files_result_text(result)
+        }
+        Some(maa::request::input::tool_call_result::Result::Grep(result)) => {
+            grep_result_text(result)
+        }
+        Some(maa::request::input::tool_call_result::Result::ApplyFileDiffs(result)) => {
+            apply_file_diffs_tool_result_text(result)
+        }
+        _ => "Tool result is unavailable.".to_string(),
+    }
+}
+
+fn run_shell_command_result_text(result: &maa::RunShellCommandResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::run_shell_command_result::Result::CommandFinished(finished)) => format!(
+            "Command: {}\nExit code: {}\n\n{}",
+            result.command,
+            finished.exit_code,
+            strip_local_command_header(&finished.output)
+        ),
+        Some(maa::run_shell_command_result::Result::PermissionDenied(_)) => {
+            format!("Command was not approved: {}", result.command)
+        }
+        _ => format!("Command result for {} is unavailable.", result.command),
+    }
+}
+
+fn read_files_result_text(result: &maa::ReadFilesResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::read_files_result::Result::TextFilesSuccess(success)) => success
+            .files
+            .iter()
+            .map(file_content_text)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Some(maa::read_files_result::Result::AnyFilesSuccess(success)) => {
+            let files = success
+                .files
+                .iter()
+                .map(any_file_content_text)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if files.is_empty() {
+                format!("Read {} file(s).", success.files.len())
+            } else {
+                files
+            }
+        }
+        Some(maa::read_files_result::Result::Error(error)) => error.message.clone(),
+        None => "Read file result is unavailable.".to_string(),
+    }
+}
+
+fn file_content_text(file: &maa::FileContent) -> String {
+    format!("{}:\n{}", file.file_path, file.content)
+}
+
+fn any_file_content_text(file: &maa::AnyFileContent) -> String {
+    match file.content.as_ref() {
+        Some(maa::any_file_content::Content::TextContent(file)) => file_content_text(file),
+        Some(maa::any_file_content::Content::BinaryContent(file)) => {
+            format!("{}:\n<binary file>", file.file_path)
+        }
+        None => "Unknown file content.".to_string(),
+    }
+}
+
+fn grep_result_text(result: &maa::GrepResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::grep_result::Result::Success(success)) => success
+            .matched_files
+            .iter()
+            .map(|file| {
+                let lines = file
+                    .matched_lines
+                    .iter()
+                    .map(|line| line.line_number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}: {}", file.file_path, lines)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(maa::grep_result::Result::Error(error)) => error.message.clone(),
+        None => "Grep result is unavailable.".to_string(),
+    }
+}
+
+fn apply_file_diffs_tool_result_text(result: &maa::ApplyFileDiffsResult) -> String {
+    match result.result.as_ref() {
+        Some(maa::apply_file_diffs_result::Result::Success(success)) => {
+            apply_file_diffs_result_text(success)
+        }
+        Some(maa::apply_file_diffs_result::Result::Error(error)) => error.message.clone(),
+        None => "File edit result is unavailable.".to_string(),
     }
 }
 
@@ -1612,11 +1740,11 @@ where
 }
 
 async fn run_openai_agent_loop_with_progress<F, Fut, OnToolCall, OnToolResult>(
-    mut messages: Vec<Value>,
-    workspace: &Path,
+    messages: Vec<Value>,
+    _workspace: &Path,
     mut complete: F,
     mut on_tool_call: OnToolCall,
-    mut on_tool_result: OnToolResult,
+    _on_tool_result: OnToolResult,
 ) -> Result<LocalAgentRun>
 where
     F: FnMut(Vec<Value>) -> Fut,
@@ -1624,37 +1752,17 @@ where
     OnToolCall: FnMut(&LocalToolCall) + Send,
     OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
-    let mut tool_events = Vec::new();
-    for _ in 0..LOCAL_AGENT_MAX_TURNS {
-        let response = complete(messages.clone()).await?;
-        let turn = parse_openai_assistant_turn(&response)?;
-        if turn.tool_calls.is_empty() {
-            return Ok(LocalAgentRun {
-                output: turn.content,
-                tool_events,
-            });
-        }
-
-        messages.push(openai_assistant_message(&turn));
-        for tool_call in &turn.tool_calls {
-            on_tool_call(tool_call);
-            let result =
-                execute_local_tool(tool_call, workspace).unwrap_or_else(|err| LocalToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    name: tool_call.name.clone(),
-                    content: format!("Tool failed: {err:#}"),
-                });
-            messages.push(openai_tool_result_message(&result));
-            let event = LocalToolEvent {
-                tool_call: tool_call.clone(),
-                result,
-            };
-            on_tool_result(&event);
-            tool_events.push(event);
-        }
+    let response = complete(messages).await?;
+    let turn = parse_openai_assistant_turn(&response)?;
+    for tool_call in &turn.tool_calls {
+        on_tool_call(tool_call);
     }
 
-    anyhow::bail!("local agent exceeded {LOCAL_AGENT_MAX_TURNS} tool turns")
+    Ok(LocalAgentRun {
+        output: turn.content,
+        tool_calls: turn.tool_calls,
+        tool_events: Vec::new(),
+    })
 }
 
 fn local_agent_system_prompt() -> &'static str {
@@ -2100,17 +2208,19 @@ fn multi_agent_response_event_stream(state: ServerState, request: maa::Request) 
             Err(err) => local_agent_error_run(err),
         };
 
-        send_response_event(
-            &tx,
-            add_messages_event(
-                &task_info.id,
-                vec![agent_output_message(
-                    &run.output,
+        if !run.output.trim().is_empty() {
+            send_response_event(
+                &tx,
+                add_messages_event(
                     &task_info.id,
-                    &stream_ids.request_id,
-                )],
-            ),
-        );
+                    vec![agent_output_message(
+                        &run.output,
+                        &task_info.id,
+                        &stream_ids.request_id,
+                    )],
+                ),
+            );
+        }
         send_response_event(&tx, finished_event());
     });
 
@@ -2122,6 +2232,13 @@ fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa:
     let stream_ids = stream_ids(request);
     let task_info = task_info(request);
     let mut messages = Vec::new();
+    for tool_call in &run.tool_calls {
+        messages.push(local_tool_call_message(
+            tool_call,
+            &task_info.id,
+            &stream_ids.request_id,
+        ));
+    }
     for event in &run.tool_events {
         messages.push(local_tool_call_message(
             &event.tool_call,
@@ -2134,11 +2251,13 @@ fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa:
             &stream_ids.request_id,
         ));
     }
-    messages.push(agent_output_message(
-        &run.output,
-        &task_info.id,
-        &stream_ids.request_id,
-    ));
+    if !run.output.trim().is_empty() {
+        messages.push(agent_output_message(
+            &run.output,
+            &task_info.id,
+            &stream_ids.request_id,
+        ));
+    }
 
     let mut actions = Vec::new();
     if task_info.needs_create {
@@ -2965,6 +3084,95 @@ description = "Qwen coding"
 
     #[allow(deprecated)]
     #[test]
+    fn openai_messages_include_current_request_tool_result() {
+        let request = maa::Request {
+            task_context: Some(maa::request::TaskContext {
+                tasks: vec![maa::Task {
+                    id: "task-1".to_string(),
+                    description: "task".to_string(),
+                    dependencies: None,
+                    messages: vec![maa::Message {
+                        id: "m1".to_string(),
+                        task_id: "task-1".to_string(),
+                        request_id: "r1".to_string(),
+                        timestamp: None,
+                        server_message_data: String::new(),
+                        citations: Vec::new(),
+                        message: Some(maa::message::Message::ToolCall(
+                            maa::message::ToolCall {
+                                tool_call_id: "call_read".to_string(),
+                                tool: Some(maa::message::tool_call::Tool::ReadFiles(
+                                    maa::message::tool_call::ReadFiles {
+                                        files: vec![maa::message::tool_call::read_files::File {
+                                            name: "notes.md".to_string(),
+                                            line_ranges: Vec::new(),
+                                        }],
+                                    },
+                                )),
+                            },
+                        )),
+                    }],
+                    summary: String::new(),
+                    server_data: String::new(),
+                }],
+            }),
+            input: Some(maa::request::Input {
+                context: None,
+                r#type: Some(maa::request::input::Type::UserInputs(
+                    maa::request::input::UserInputs {
+                        inputs: vec![maa::request::input::user_inputs::UserInput {
+                            input: Some(
+                                maa::request::input::user_inputs::user_input::Input::ToolCallResult(
+                                    maa::request::input::ToolCallResult {
+                                        tool_call_id: "call_read".to_string(),
+                                        result: Some(
+                                            maa::request::input::tool_call_result::Result::ReadFiles(
+                                                maa::ReadFilesResult {
+                                                    result: Some(
+                                                        maa::read_files_result::Result::AnyFilesSuccess(
+                                                            maa::read_files_result::AnyFilesSuccess {
+                                                                files: vec![maa::AnyFileContent {
+                                                                    content: Some(
+                                                                        maa::any_file_content::Content::TextContent(
+                                                                            maa::FileContent {
+                                                                                file_path: "notes.md".to_string(),
+                                                                                content: "local notes".to_string(),
+                                                                                line_range: None,
+                                                                            },
+                                                                        ),
+                                                                    ),
+                                                                }],
+                                                            },
+                                                        ),
+                                                    ),
+                                                },
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            ),
+                        }],
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let messages = openai_messages_for_request(&request);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_read");
+        assert_eq!(messages[2]["content"], "notes.md:\nlocal notes");
+    }
+
+    #[allow(deprecated)]
+    #[test]
     fn api_tool_result_text_strips_local_command_header() {
         let result = maa::message::ToolCallResult {
             tool_call_id: "call_bash".to_string(),
@@ -3176,7 +3384,7 @@ description = "Qwen coding"
     }
 
     #[tokio::test]
-    async fn agent_loop_sends_tool_result_back_to_model() {
+    async fn agent_loop_surfaces_tool_call_without_executing_it() {
         let tempdir = tempfile::tempdir().unwrap();
         fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3190,31 +3398,23 @@ description = "Qwen coding"
                     let calls = calls.clone();
                     async move {
                         match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                            0 => Ok(json!({
-                                "choices": [{
-                                    "message": {
-                                        "content": "",
-                                        "tool_calls": [{
-                                            "id": "call_read",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "read_file",
-                                                "arguments": "{\"path\":\"notes.md\"}"
-                                            }
-                                        }]
-                                    }
-                                }]
-                            })),
-                            1 => {
-                                assert!(messages.iter().any(|message| {
-                                    message["role"] == "tool"
-                                        && message["tool_call_id"] == "call_read"
-                                        && message["content"] == "local notes"
+                            0 => {
+                                assert!(messages.iter().all(|message| {
+                                    message["role"] != "tool"
+                                        && message.get("tool_call_id").is_none()
                                 }));
                                 Ok(json!({
                                     "choices": [{
                                         "message": {
-                                            "content": "notes.md says: local notes"
+                                            "content": "",
+                                            "tool_calls": [{
+                                                "id": "call_read",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "read_file",
+                                                    "arguments": "{\"path\":\"notes.md\"}"
+                                                }
+                                            }]
                                         }
                                     }]
                                 }))
@@ -3228,14 +3428,16 @@ description = "Qwen coding"
         .await
         .unwrap();
 
-        assert_eq!(output.output, "notes.md says: local notes");
-        assert_eq!(output.tool_events.len(), 1);
-        assert_eq!(output.tool_events[0].tool_call.name, "read_file");
-        assert_eq!(output.tool_events[0].result.content, "local notes");
+        assert_eq!(output.output, "");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "read_file");
+        assert_eq!(output.tool_calls[0].arguments["path"], "notes.md");
+        assert!(output.tool_events.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn agent_loop_reports_tool_call_before_tool_result() {
+    async fn agent_loop_reports_tool_call_without_tool_result() {
         let tempdir = tempfile::tempdir().unwrap();
         fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3262,13 +3464,6 @@ description = "Qwen coding"
                                                 "arguments": "{\"path\":\"notes.md\"}"
                                             }
                                         }]
-                                    }
-                                }]
-                            })),
-                            1 => Ok(json!({
-                                "choices": [{
-                                    "message": {
-                                        "content": "done"
                                     }
                                 }]
                             })),
@@ -3299,11 +3494,11 @@ description = "Qwen coding"
         .await
         .unwrap();
 
-        assert_eq!(output.output, "done");
-        assert_eq!(
-            progress.lock().unwrap().as_slice(),
-            ["call:read_file", "result:read_file"]
-        );
+        assert_eq!(output.output, "");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert!(output.tool_events.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(progress.lock().unwrap().as_slice(), ["call:read_file"]);
     }
 
     #[test]
@@ -3372,7 +3567,7 @@ description = "Qwen coding"
     }
 
     #[tokio::test]
-    async fn openai_compatible_call_runs_tools_against_workspace() {
+    async fn openai_compatible_call_surfaces_tools_for_client_approval() {
         let tempdir = tempfile::tempdir().unwrap();
         fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
 
@@ -3410,13 +3605,7 @@ description = "Qwen coding"
                                     }
                                 }]
                             })),
-                            _ => Json(json!({
-                                "choices": [{
-                                    "message": {
-                                        "content": "notes.md says: local notes"
-                                    }
-                                }]
-                            })),
+                            _ => panic!("agent loop called the model too many times"),
                         }
                     }
                 }
@@ -3447,11 +3636,15 @@ description = "Qwen coding"
         .unwrap();
         server.abort();
 
-        assert_eq!(output.output, "notes.md says: local notes");
+        assert_eq!(output.output, "");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "read_file");
+        assert_eq!(output.tool_calls[0].arguments["path"], "notes.md");
+        assert!(output.tool_events.is_empty());
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies.len(), 1);
         let headers = headers.lock().unwrap();
-        assert_eq!(headers.len(), 2);
+        assert_eq!(headers.len(), 1);
         assert!(headers.iter().all(|headers| {
             headers
                 .get(header::USER_AGENT)
@@ -3462,15 +3655,7 @@ description = "Qwen coding"
             .unwrap()
             .iter()
             .any(|tool| { tool["type"] == "function" && tool["function"]["name"] == "read_file" }));
-        assert!(bodies[1]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| {
-                message["role"] == "tool"
-                    && message["tool_call_id"] == "call_read"
-                    && message["content"] == "local notes"
-            }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3478,6 +3663,7 @@ description = "Qwen coding"
         let request = maa::Request::default();
         let run = LocalAgentRun {
             output: "done".to_string(),
+            tool_calls: Vec::new(),
             tool_events: vec![LocalToolEvent {
                 tool_call: LocalToolCall {
                     id: "call_read".to_string(),
