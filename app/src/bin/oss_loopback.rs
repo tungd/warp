@@ -4,6 +4,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,13 +33,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_sharing_protocol::{
     common::{
-        ActivePrompt, AbsentViewer, CommandExecutionFailureReason, CommandExecutionRequestId,
+        AbsentViewer, ActivePrompt, CommandExecutionFailureReason, CommandExecutionRequestId,
         ControlActionFailureReason, ControlActionRequestId, InputReplicaId, InputUpdate,
         OrderedTerminalEvent, ParticipantId, ParticipantInfo, ParticipantList,
         ParticipantPresenceUpdate, PresenceUpdate, PresentViewer, ProfileData, Role,
         RoleRequestRejectedReason, RoleRequestResponse, Scrollback, Selection, SessionId,
-        SessionSecret, UniversalDeveloperInputContext, Viewer, WindowSize,
-        WriteToPtyFailureReason,
+        SessionSecret, UniversalDeveloperInputContext, Viewer, WindowSize, WriteToPtyFailureReason,
     },
     sharer::{self as sharer_protocol, ReconnectToken},
     viewer::{self as viewer_protocol, RoleUpdatedReason},
@@ -53,6 +53,7 @@ use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
 const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
+const LOCAL_AGENT_WORKER_FILE: &str = "agent-worker.toml";
 const LOCAL_LLM_FILE: &str = "llm.toml";
 #[cfg(test)]
 const LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS: usize = 30;
@@ -305,6 +306,59 @@ struct LocalLlmConfigModel {
     thinking_budget: Option<u32>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct LocalAgentWorkerConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_agent_worker_bind")]
+    bind: String,
+    #[serde(default)]
+    port: u16,
+    pairing_token: Option<String>,
+}
+
+impl Default for LocalAgentWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_agent_worker_bind(),
+            port: 0,
+            pairing_token: None,
+        }
+    }
+}
+
+impl LocalAgentWorkerConfig {
+    fn load() -> Result<Self> {
+        let path = agent_worker_config_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .and_then(|contents| {
+                toml::from_str(&contents)
+                    .with_context(|| format!("failed to parse {}", path.display()))
+            })
+    }
+
+    fn bind_addr(&self) -> Result<SocketAddr> {
+        let bind = self.bind.trim();
+        let bind = if bind.is_empty() {
+            default_agent_worker_bind()
+        } else {
+            bind.to_owned()
+        };
+        SocketAddr::from_str(&format!("{bind}:{}", self.port))
+            .with_context(|| format!("invalid agent worker bind address: {bind}:{}", self.port))
+    }
+}
+
+fn default_agent_worker_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
 impl LocalLlmConfigModel {
     fn alias_or_name(&self) -> &str {
         self.alias
@@ -377,6 +431,7 @@ struct ServerState {
     account: Arc<LocalAccount>,
     client: reqwest::Client,
     shared_sessions: SharedSessionStore,
+    worker_config: Arc<LocalAgentWorkerConfig>,
 }
 
 type SharedSessionStore = Arc<RwLock<HashMap<SessionId, SharedSession>>>;
@@ -420,10 +475,18 @@ impl LoopbackServer {
             .timeout(Duration::from_secs(120))
             .build()
             .context("failed to create OSS loopback HTTP client")?;
+        let worker_config = Arc::new(match LocalAgentWorkerConfig::load() {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!("Ignoring local agent worker config: {err:#}");
+                LocalAgentWorkerConfig::default()
+            }
+        });
         let state = ServerState {
             account,
             client,
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
+            worker_config,
         };
 
         let std_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -453,7 +516,23 @@ impl LoopbackServer {
             .route("/sessions/create", get(create_session_ws))
             .route("/sessions/join/{session_id}", get(join_session_ws))
             .route("/sessions/{session_id}/resume", get(resume_session_ws))
-            .with_state(state);
+            .with_state(state.clone());
+
+        let worker_listener = if state.worker_config.enabled {
+            let bind_addr = state.worker_config.bind_addr()?;
+            let listener = std::net::TcpListener::bind(bind_addr)
+                .context("failed to bind WarpSOLO agent worker listener")?;
+            listener
+                .set_nonblocking(true)
+                .context("failed to configure WarpSOLO agent worker listener")?;
+            Some(listener)
+        } else {
+            None
+        };
+        let worker_root_url = worker_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| format!("http://{addr}"));
 
         runtime.spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -468,8 +547,30 @@ impl LoopbackServer {
             }
         });
 
+        if let Some(std_listener) = worker_listener {
+            let router = Router::new()
+                .route("/worker/health", get(worker_health))
+                .route("/worker/capabilities", get(worker_capabilities))
+                .with_state(state);
+            runtime.spawn(async move {
+                let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        log::warn!("Failed to adopt WarpSOLO agent worker listener: {err:#}");
+                        return;
+                    }
+                };
+                if let Err(err) = axum::serve(listener, router).await {
+                    log::warn!("WarpSOLO agent worker server exited: {err:#}");
+                }
+            });
+        }
+
         let server_root_url = format!("http://{addr}");
         log::info!("Started OSS loopback server at {server_root_url}");
+        if let Some(worker_root_url) = &worker_root_url {
+            log::info!("Started WarpSOLO agent worker at {worker_root_url}");
+        }
 
         Ok(Self {
             _runtime: runtime,
@@ -491,6 +592,31 @@ async fn healthz(State(state): State<ServerState>) -> Json<Value> {
         "ok": true,
         "userId": state.account.user_id,
         "deviceId": state.account.device_id,
+    }))
+}
+
+async fn worker_health(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "app": "WarpSOLO",
+        "version": 1,
+        "deviceId": state.account.device_id,
+        "userId": state.account.user_id,
+        "displayName": state.account.display_name,
+    }))
+}
+
+async fn worker_capabilities(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({
+        "version": 1,
+        "deviceId": state.account.device_id,
+        "displayName": state.account.display_name,
+        "capabilities": ["agent", "terminal", "workspace"],
+        "auth": if state.worker_config.pairing_token.as_deref().is_some_and(|token| !token.trim().is_empty()) {
+            "pairing-token-v1"
+        } else {
+            "none"
+        },
     }))
 }
 
@@ -521,10 +647,7 @@ async fn session_page(AxumPath(session_id): AxumPath<String>) -> Response {
     .into_response()
 }
 
-async fn create_session_ws(
-    State(state): State<ServerState>,
-    ws: WebSocketUpgrade,
-) -> Response {
+async fn create_session_ws(State(state): State<ServerState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_create_session_socket(state, socket))
         .into_response()
 }
@@ -611,11 +734,7 @@ async fn handle_create_session_socket(state: ServerState, socket: WebSocket) {
     handle_sharer_messages(state, session_id, out_tx, incoming).await;
 }
 
-async fn handle_resume_session_socket(
-    state: ServerState,
-    session_id: String,
-    socket: WebSocket,
-) {
+async fn handle_resume_session_socket(state: ServerState, session_id: String, socket: WebSocket) {
     let Ok(session_id) = session_id.parse::<SessionId>() else {
         return;
     };
@@ -673,11 +792,7 @@ async fn handle_resume_session_socket(
     handle_sharer_messages(state, session_id, out_tx, incoming).await;
 }
 
-async fn handle_join_session_socket(
-    state: ServerState,
-    session_id: String,
-    socket: WebSocket,
-) {
+async fn handle_join_session_socket(state: ServerState, session_id: String, socket: WebSocket) {
     let Ok(session_id) = session_id.parse::<SessionId>() else {
         return;
     };
@@ -795,10 +910,8 @@ async fn handle_sharer_messages(
 
         match message {
             sharer_protocol::UpstreamMessage::Ping { data } => {
-                let _ = send_sharer_message(
-                    &out_tx,
-                    sharer_protocol::DownstreamMessage::Pong { data },
-                );
+                let _ =
+                    send_sharer_message(&out_tx, sharer_protocol::DownstreamMessage::Pong { data });
             }
             sharer_protocol::UpstreamMessage::EndSession { reason } => {
                 let mut sessions = state.shared_sessions.write().await;
@@ -881,7 +994,8 @@ async fn handle_sharer_messages(
                     .universal_developer_input_context
                     .take()
                     .unwrap_or_default();
-                session.universal_developer_input_context = Some(update.clone().merge_into(current));
+                session.universal_developer_input_context =
+                    Some(update.clone().merge_into(current));
                 fanout_viewers(
                     session,
                     viewer_protocol::DownstreamMessage::UniversalDeveloperInputContextUpdated(
@@ -894,7 +1008,10 @@ async fn handle_sharer_messages(
                 let Some(session) = sessions.get_mut(&session_id) else {
                     break;
                 };
-                fanout_viewers(session, viewer_protocol::DownstreamMessage::InputUpdated(update));
+                fanout_viewers(
+                    session,
+                    viewer_protocol::DownstreamMessage::InputUpdated(update),
+                );
             }
             sharer_protocol::UpstreamMessage::UpdateRole {
                 participant_id,
@@ -948,10 +1065,8 @@ async fn handle_viewer_messages(
 
         match message {
             viewer_protocol::UpstreamMessage::Ping { data } => {
-                let _ = send_viewer_message(
-                    &out_tx,
-                    viewer_protocol::DownstreamMessage::Pong { data },
-                );
+                let _ =
+                    send_viewer_message(&out_tx, viewer_protocol::DownstreamMessage::Pong { data });
             }
             viewer_protocol::UpstreamMessage::UpdateSelection(update) => {
                 let mut sessions = state.shared_sessions.write().await;
@@ -982,8 +1097,7 @@ async fn handle_viewer_messages(
                 handle_viewer_role_request(&state, session_id, &viewer_id, role, &out_tx).await;
             }
             viewer_protocol::UpstreamMessage::UpdateInput(update) => {
-                forward_viewer_input_update(&state, session_id, &viewer_id, update, &out_tx)
-                    .await;
+                forward_viewer_input_update(&state, session_id, &viewer_id, update, &out_tx).await;
             }
             viewer_protocol::UpstreamMessage::ExecuteCommand { buffer_id, command } => {
                 let mut sessions = state.shared_sessions.write().await;
@@ -1061,9 +1175,7 @@ async fn handle_viewer_messages(
                     }
                     let _ = send_viewer_message(
                         &out_tx,
-                        viewer_protocol::DownstreamMessage::AgentPromptRequestInFlight(
-                            request_id,
-                        ),
+                        viewer_protocol::DownstreamMessage::AgentPromptRequestInFlight(request_id),
                     );
                 } else {
                     let _ = send_viewer_message(
@@ -1108,7 +1220,8 @@ async fn handle_viewer_messages(
                     .universal_developer_input_context
                     .take()
                     .unwrap_or_default();
-                session.universal_developer_input_context = Some(update.clone().merge_into(current));
+                session.universal_developer_input_context =
+                    Some(update.clone().merge_into(current));
                 if let Some(sharer_tx) = &session.sharer_tx {
                     let _ = send_sharer_message(
                         sharer_tx,
@@ -3957,6 +4070,10 @@ fn llm_info(model: &ResolvedLocalLlm) -> Value {
 
 fn account_path() -> PathBuf {
     warp_core::paths::config_local_dir().join(LOCAL_ACCOUNT_FILE)
+}
+
+fn agent_worker_config_path() -> PathBuf {
+    warp_core::paths::config_local_dir().join(LOCAL_AGENT_WORKER_FILE)
 }
 
 fn llm_config_path() -> PathBuf {
