@@ -4,6 +4,7 @@ SHELL := /bin/bash
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
 CARGO ?= $(HOME)/.cargo/bin/cargo
+RUSTUP ?= $(HOME)/.cargo/bin/rustup
 PACKAGE := warp
 BIN_NAME := warp-oss
 APP_NAME := WarpSOLO
@@ -13,6 +14,10 @@ LEGACY_APP_NAMES := WarpOSS WarpOss
 CARGO_PROFILE ?= dev
 PROFILE_DIR := $(if $(filter dev,$(CARGO_PROFILE)),debug,$(if $(filter release,$(CARGO_PROFILE)),release,$(CARGO_PROFILE)))
 BIN_PATH := target/$(PROFILE_DIR)/$(BIN_NAME)
+UNIVERSAL_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
+UNIVERSAL_DIR := target/universal/$(PROFILE_DIR)
+UNIVERSAL_BIN_PATH := $(UNIVERSAL_DIR)/$(BIN_NAME)
+BUNDLE_BIN_PATH ?= $(BIN_PATH)
 
 DIST_DIR := dist
 APP_PATH := $(DIST_DIR)/$(APP_NAME).app
@@ -34,14 +39,17 @@ ENTITLEMENTS ?= script/Debug-Entitlements.plist
 #   make install CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
 CODESIGN_IDENTITY ?= auto
 
-.PHONY: help print-config build bundle sign install run uninstall signing-identities clean-bundle
+.PHONY: help print-config build build-universal bundle bundle-universal sign sign-universal prepare-bundle install install-universal install-bundle run uninstall signing-identities clean-bundle
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make build               Build the warp-oss binary' \
+		'  make build-universal     Build a universal macOS warp-oss binary' \
 		'  make bundle              Build and sign WarpSOLO.app' \
+		'  make bundle-universal    Build and sign a universal WarpSOLO.app' \
 		'  make install             Install WarpSOLO.app to ~/Applications' \
+		'  make install-universal   Install a universal WarpSOLO.app to ~/Applications' \
 		'  make run                 Run warp-oss from cargo' \
 		'  make uninstall           Remove the installed local bundle' \
 		'  make signing-identities  List local codesigning identities' \
@@ -58,6 +66,7 @@ print-config:
 	@printf 'PACKAGE=%s\n' '$(PACKAGE)'
 	@printf 'BIN_NAME=%s\n' '$(BIN_NAME)'
 	@printf 'BIN_PATH=%s\n' '$(BIN_PATH)'
+	@printf 'UNIVERSAL_BIN_PATH=%s\n' '$(UNIVERSAL_BIN_PATH)'
 	@printf 'APP_PATH=%s\n' '$(APP_PATH)'
 	@printf 'INSTALLED_APP=%s\n' '$(INSTALLED_APP)'
 	@printf 'ICON_SOURCE=%s\n' '$(ICON_SOURCE)'
@@ -67,12 +76,29 @@ print-config:
 build:
 	$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)'
 
+build-universal:
+	$(RUSTUP) target add $(UNIVERSAL_TARGETS)
+	@for target in $(UNIVERSAL_TARGETS); do \
+		echo "Building $(BIN_NAME) for $$target"; \
+		$(CARGO) build -p '$(PACKAGE)' --bin '$(BIN_NAME)' --profile '$(CARGO_PROFILE)' --target "$$target"; \
+	done
+	mkdir -p '$(UNIVERSAL_DIR)'
+	lipo -create $(foreach target,$(UNIVERSAL_TARGETS),'target/$(target)/$(PROFILE_DIR)/$(BIN_NAME)') -output '$(UNIVERSAL_BIN_PATH)'
+	lipo -info '$(UNIVERSAL_BIN_PATH)'
+
 bundle: sign
 
-sign: build
+bundle-universal: sign-universal
+
+sign: build prepare-bundle
+
+sign-universal: BUNDLE_BIN_PATH := $(UNIVERSAL_BIN_PATH)
+sign-universal: build-universal prepare-bundle
+
+prepare-bundle:
 	rm -rf '$(APP_PATH)'
 	mkdir -p '$(MACOS_DIR)' '$(RESOURCES_DIR)'
-	cp -f '$(BIN_PATH)' '$(MACOS_DIR)/$(BIN_NAME)'
+	cp -f '$(BUNDLE_BIN_PATH)' '$(MACOS_DIR)/$(BIN_NAME)'
 	@iconset='$(RESOURCES_DIR)/$(ICON_NAME).iconset'; \
 	if [[ -f '$(ICON_SOURCE)' ]]; then \
 		rm -rf "$$iconset"; \
@@ -144,7 +170,11 @@ sign: build
 	echo "Codesigning $(APP_PATH) with $$identity"; \
 	codesign --force --deep --options runtime --sign "$$identity" '$(APP_PATH)' --entitlements '$(ENTITLEMENTS)'
 
-install: bundle
+install: bundle install-bundle
+
+install-universal: bundle-universal install-bundle
+
+install-bundle:
 	mkdir -p '$(INSTALL_DIR)'
 	rm -rf '$(INSTALLED_APP)'
 	@for app in $(LEGACY_INSTALLED_APPS); do \
