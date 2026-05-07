@@ -106,6 +106,50 @@ pub(crate) async fn discovered_workers(
     Json(DiscoveredWorkersResponse { workers })
 }
 
+pub(crate) async fn find_worker(
+    store: &DiscoveredWorkerStore,
+    worker_host: &str,
+) -> Option<DiscoveredWorker> {
+    let worker_host = worker_host.trim();
+    let workers = store.read().await;
+
+    if worker_host.is_empty() || worker_host.eq_ignore_ascii_case("warp") {
+        return (workers.len() == 1)
+            .then(|| workers.values().next().cloned())
+            .flatten();
+    }
+
+    workers
+        .values()
+        .find(|worker| worker.matches(worker_host))
+        .cloned()
+}
+
+impl DiscoveredWorker {
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn matches(&self, worker_host: &str) -> bool {
+        [self.device_id(), self.display_name(), self.hostname()]
+            .into_iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(worker_host))
+            || self.service_name.eq_ignore_ascii_case(worker_host)
+    }
+
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn hostname(&self) -> &str {
+        &self.hostname
+    }
+}
+
 pub(crate) fn worker_auth(worker_config: &LocalAgentWorkerConfig) -> &'static str {
     if worker_config
         .pairing_token

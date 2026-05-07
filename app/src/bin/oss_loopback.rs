@@ -52,6 +52,8 @@ use warp_multi_agent_api as maa;
 mod agent_state;
 #[path = "oss_loopback/bonjour.rs"]
 mod bonjour;
+#[path = "oss_loopback/coordinator.rs"]
+mod coordinator;
 #[path = "oss_loopback/state.rs"]
 mod state;
 #[path = "oss_loopback/worker.rs"]
@@ -3369,6 +3371,12 @@ fn shell_exit_code_from_content(content: &str) -> i32 {
 fn multi_agent_response_event_stream(state: ServerState, request: maa::Request) -> Response {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
+        if coordinator::try_proxy_multi_agent_to_worker(state.clone(), request.clone(), tx.clone())
+            .await
+        {
+            return;
+        }
+
         let stream_ids = stream_ids(&request);
         let task_info = task_info(&request);
         send_response_event(&tx, init_event(&stream_ids));
