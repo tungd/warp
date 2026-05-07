@@ -5,7 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, State},
@@ -324,7 +323,7 @@ async fn start_worker_run(
     request: WorkerRunCreateRequest,
 ) -> std::result::Result<WorkerRunCreateResponse, Response> {
     let request = normalize_create_request(request)?;
-    let workspace = workspace_path(&request)?;
+    let workspace = workspace_path(&request, &state.worker_config)?;
     let run_id = Uuid::new_v4().to_string();
     let record = WorkerRunRecord::new(run_id.clone(), request.clone(), workspace.clone());
 
@@ -528,11 +527,17 @@ fn normalize_create_request(
     Ok(request)
 }
 
-fn workspace_path(request: &WorkerRunCreateRequest) -> std::result::Result<PathBuf, Response> {
-    let workspace = request.workspace.as_deref().map_or_else(
-        || std::env::current_dir().context("failed to resolve current directory"),
-        |workspace| Ok(PathBuf::from(workspace)),
-    );
+fn workspace_path(
+    request: &WorkerRunCreateRequest,
+    worker_config: &LocalAgentWorkerConfig,
+) -> std::result::Result<PathBuf, Response> {
+    let workspace = request
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(|workspace| Ok(PathBuf::from(workspace)))
+        .unwrap_or_else(|| worker_config.default_workspace_path());
     let workspace = workspace.map_err(|err| {
         json_error(
             StatusCode::BAD_REQUEST,

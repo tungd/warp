@@ -303,7 +303,7 @@ async fn spawn_agent_run(
     };
     let workspace = workspace_from_spawn_request(&request)?;
     let worker_url = worker.url().to_string();
-    let created = create_worker_run(&state, &worker_url, &request, &workspace).await?;
+    let created = create_worker_run(&state, &worker_url, &request).await?;
     let run_id = created.run_id.clone();
     let now = now_rfc3339();
     let record = CloudAgentRunRecord {
@@ -350,7 +350,6 @@ async fn create_worker_run(
     state: &ServerState,
     worker_url: &str,
     request: &SpawnAgentRequest,
-    workspace: &std::path::Path,
 ) -> std::result::Result<WorkerRunCreateResponse, Response> {
     let create_url = join_worker_url(worker_url, "/worker/runs").map_err(|err| {
         json_error(
@@ -360,7 +359,7 @@ async fn create_worker_run(
     })?;
     let worker_request = WorkerRunCreateRequest {
         prompt: request.prompt.clone(),
-        workspace: Some(workspace.display().to_string()),
+        workspace: worker_workspace_from_config(request.config.as_ref()),
         model_id: model_id_from_config(request.config.as_ref()),
         harness: Some("local-openai".to_string()),
         source_device_id: state.account.device_id.clone(),
@@ -693,6 +692,19 @@ fn model_id_from_config(config: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn worker_workspace_from_config(config: Option<&Value>) -> Option<String> {
+    config
+        .and_then(|config| {
+            config
+                .get("worker_workspace")
+                .or_else(|| config.get("workerWorkspace"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn workspace_from_spawn_request(
     request: &SpawnAgentRequest,
 ) -> std::result::Result<PathBuf, Response> {
@@ -830,6 +842,19 @@ mod tests {
             environment_id_from_config(Some(&json!({ "environmentId": "wsolo-test" }))),
             Some("wsolo-test")
         );
+    }
+
+    #[test]
+    fn worker_workspace_reads_snake_and_camel_case() {
+        assert_eq!(
+            worker_workspace_from_config(Some(&json!({ "worker_workspace": "/tmp/remote" }))),
+            Some("/tmp/remote".to_string())
+        );
+        assert_eq!(
+            worker_workspace_from_config(Some(&json!({ "workerWorkspace": "/tmp/remote" }))),
+            Some("/tmp/remote".to_string())
+        );
+        assert_eq!(worker_workspace_from_config(Some(&json!({}))), None);
     }
 
     #[test]

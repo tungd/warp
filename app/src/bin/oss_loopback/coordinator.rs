@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -11,7 +11,7 @@ use super::{
     add_messages_event, agent_output_message, agent_reasoning_message, create_task_action,
     extract_user_prompt, finished_event, init_event, local_tool_call_message,
     local_tool_result_message, send_response_event, stream_ids, task_info, worker_discovery,
-    workspace_for_request, LocalToolCall, LocalToolEvent, LocalToolResult, ServerState,
+    LocalToolCall, LocalToolEvent, LocalToolResult, ServerState,
 };
 
 const WORKER_DEFAULT_HARNESS: &str = "local-openai";
@@ -20,7 +20,6 @@ const WORKER_DEFAULT_HARNESS: &str = "local-openai";
 pub(crate) struct RemoteWorkerRequest {
     worker_host: String,
     prompt: String,
-    workspace: PathBuf,
     model_id: Option<String>,
     harness: Option<String>,
 }
@@ -147,7 +146,7 @@ async fn proxy_worker_events(
     let create_url = join_worker_url(worker_url, "/worker/runs")?;
     let create = WorkerRunCreateRequest {
         prompt: remote_request.prompt.clone(),
-        workspace: Some(remote_request.workspace.display().to_string()),
+        workspace: None,
         model_id: remote_request.model_id.clone(),
         harness: remote_request.harness.clone(),
         source_device_id: state.account.device_id.clone(),
@@ -353,11 +352,9 @@ pub(crate) fn remote_worker_request_from_maa(
     let prompt = extract_user_prompt(request)
         .filter(|prompt| !prompt.trim().is_empty())
         .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
-    let workspace = workspace_for_request(request);
     Some(RemoteWorkerRequest {
         worker_host,
         prompt,
-        workspace,
         model_id: (!config.model_id.trim().is_empty()).then(|| config.model_id.trim().to_string()),
         harness: Some(WORKER_DEFAULT_HARNESS.to_string()),
     })
@@ -479,7 +476,6 @@ mod tests {
         let remote = remote_worker_request_from_maa(&request).expect("remote worker request");
         assert_eq!(remote.worker_host, "local-device-devbox");
         assert_eq!(remote.prompt, "run the tests");
-        assert_eq!(remote.workspace, PathBuf::from("/tmp/warp-solo-test"));
         assert_eq!(remote.harness.as_deref(), Some(WORKER_DEFAULT_HARNESS));
     }
 

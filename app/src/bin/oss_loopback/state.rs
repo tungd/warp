@@ -1,4 +1,4 @@
-use std::{fs, net::SocketAddr, str::FromStr};
+use std::{fs, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,7 @@ pub(crate) struct LocalAgentWorkerConfig {
     bind: String,
     #[serde(default)]
     port: u16,
+    default_workspace: Option<String>,
     pub(crate) pairing_token: Option<String>,
     #[serde(default)]
     pub(crate) peers: Vec<LocalAgentPeerConfig>,
@@ -97,6 +98,7 @@ impl Default for LocalAgentWorkerConfig {
             enabled: false,
             bind: default_agent_worker_bind(),
             port: 0,
+            default_workspace: None,
             pairing_token: None,
             peers: Vec::new(),
         }
@@ -131,6 +133,23 @@ impl LocalAgentWorkerConfig {
 
     pub(crate) const fn port(&self) -> u16 {
         self.port
+    }
+
+    pub(crate) fn default_workspace_path(&self) -> Result<PathBuf> {
+        if let Some(path) = self
+            .default_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            return Ok(expand_home_path(path));
+        }
+
+        if let Some(home) = std::env::var_os("HOME") {
+            return Ok(PathBuf::from(home));
+        }
+
+        std::env::current_dir().context("failed to resolve current directory")
     }
 }
 
@@ -195,4 +214,18 @@ fn local_username() -> String {
 
 fn default_agent_worker_bind() -> String {
     "127.0.0.1".to_string()
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    PathBuf::from(path)
 }
