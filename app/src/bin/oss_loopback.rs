@@ -4,7 +4,6 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,7 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 #[cfg(test)]
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use session_sharing_protocol::{
     common::{
@@ -52,8 +51,20 @@ use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
 
-const LOCAL_ACCOUNT_FILE: &str = "local-account.json";
-const LOCAL_AGENT_WORKER_FILE: &str = "agent-worker.toml";
+#[path = "oss_loopback/agent_state.rs"]
+mod agent_state;
+#[path = "oss_loopback/bonjour.rs"]
+mod bonjour;
+#[path = "oss_loopback/state.rs"]
+mod state;
+
+#[cfg(test)]
+use agent_state::LocalCommandOutput;
+use agent_state::{
+    LocalAgentRun, LocalAssistantTurn, LocalToolCall, LocalToolEvent, LocalToolResult,
+};
+use state::{LocalAccount, LocalAgentWorkerConfig};
+
 const LOCAL_LLM_FILE: &str = "llm.toml";
 #[cfg(test)]
 const LOCAL_TOOL_DEFAULT_COMMAND_TIMEOUT_SECS: usize = 30;
@@ -72,68 +83,6 @@ const LOCAL_TOOL_MAX_READ_BYTES: usize = 64_000;
 #[cfg(test)]
 const LOCAL_TOOL_MAX_WRITE_BYTES: usize = 64_000;
 const TOKEN_TTL_SECONDS: &str = "3600";
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct LocalAccount {
-    user_id: String,
-    device_id: String,
-    display_name: String,
-    id_token: String,
-    refresh_token: String,
-    custom_token: String,
-}
-
-impl LocalAccount {
-    fn load_or_create() -> Result<Self> {
-        let path = account_path();
-        if path.exists() {
-            let mut account: Self = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))
-                .and_then(|contents| {
-                    serde_json::from_str(&contents)
-                        .with_context(|| format!("failed to parse {}", path.display()))
-                })?;
-            if account.sync_local_identity() {
-                let contents = serde_json::to_string_pretty(&account)?;
-                fs::write(&path, contents)
-                    .with_context(|| format!("failed to write {}", path.display()))?;
-            }
-            return Ok(account);
-        }
-
-        let account = Self {
-            user_id: local_user_id(),
-            device_id: local_device_id(),
-            display_name: local_display_name(),
-            id_token: format!("local-id-token-{}", Uuid::new_v4()),
-            refresh_token: format!("local-refresh-token-{}", Uuid::new_v4()),
-            custom_token: format!("local-custom-token-{}", Uuid::new_v4()),
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let contents = serde_json::to_string_pretty(&account)?;
-        fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(account)
-    }
-
-    fn sync_local_identity(&mut self) -> bool {
-        let user_id = local_user_id();
-        let device_id = local_device_id();
-        let display_name = local_display_name();
-        let changed = self.user_id != user_id
-            || self.device_id != device_id
-            || self.display_name != display_name;
-        if changed {
-            self.user_id = user_id;
-            self.device_id = device_id;
-            self.display_name = display_name;
-        }
-        changed
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct LocalLlmConfig {
@@ -306,59 +255,6 @@ struct LocalLlmConfigModel {
     thinking_budget: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct LocalAgentWorkerConfig {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default = "default_agent_worker_bind")]
-    bind: String,
-    #[serde(default)]
-    port: u16,
-    pairing_token: Option<String>,
-}
-
-impl Default for LocalAgentWorkerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: default_agent_worker_bind(),
-            port: 0,
-            pairing_token: None,
-        }
-    }
-}
-
-impl LocalAgentWorkerConfig {
-    fn load() -> Result<Self> {
-        let path = agent_worker_config_path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))
-            .and_then(|contents| {
-                toml::from_str(&contents)
-                    .with_context(|| format!("failed to parse {}", path.display()))
-            })
-    }
-
-    fn bind_addr(&self) -> Result<SocketAddr> {
-        let bind = self.bind.trim();
-        let bind = if bind.is_empty() {
-            default_agent_worker_bind()
-        } else {
-            bind.to_owned()
-        };
-        SocketAddr::from_str(&format!("{bind}:{}", self.port))
-            .with_context(|| format!("invalid agent worker bind address: {bind}:{}", self.port))
-    }
-}
-
-fn default_agent_worker_bind() -> String {
-    "127.0.0.1".to_string()
-}
-
 impl LocalLlmConfigModel {
     fn alias_or_name(&self) -> &str {
         self.alias
@@ -430,6 +326,7 @@ impl ResolvedLocalLlm {
 struct ServerState {
     account: Arc<LocalAccount>,
     client: reqwest::Client,
+    discovered_workers: bonjour::DiscoveredWorkerStore,
     shared_sessions: SharedSessionStore,
     worker_config: Arc<LocalAgentWorkerConfig>,
 }
@@ -465,6 +362,7 @@ struct SharedSession {
 
 pub struct LoopbackServer {
     _runtime: Runtime,
+    _bonjour: Option<bonjour::BonjourRuntime>,
     server_root_url: String,
 }
 
@@ -485,6 +383,7 @@ impl LoopbackServer {
         let state = ServerState {
             account,
             client,
+            discovered_workers: bonjour::new_discovered_worker_store(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             worker_config,
         };
@@ -516,6 +415,7 @@ impl LoopbackServer {
             .route("/sessions/create", get(create_session_ws))
             .route("/sessions/join/{session_id}", get(join_session_ws))
             .route("/sessions/{session_id}/resume", get(resume_session_ws))
+            .route("/worker/discovered", get(bonjour::discovered_workers))
             .with_state(state.clone());
 
         let worker_listener = if state.worker_config.enabled {
@@ -529,10 +429,19 @@ impl LoopbackServer {
         } else {
             None
         };
-        let worker_root_url = worker_listener
+        let worker_addr = worker_listener
             .as_ref()
             .and_then(|listener| listener.local_addr().ok())
-            .map(|addr| format!("http://{addr}"));
+            .map(|addr| addr);
+        let worker_root_url = worker_addr.map(|addr| format!("http://{addr}"));
+
+        let bonjour = match bonjour::start(state.clone(), worker_addr) {
+            Ok(runtime) => Some(runtime),
+            Err(err) => {
+                log::warn!("WarpSOLO Bonjour discovery is disabled: {err:#}");
+                None
+            }
+        };
 
         runtime.spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -574,6 +483,7 @@ impl LoopbackServer {
 
         Ok(Self {
             _runtime: runtime,
+            _bonjour: bonjour,
             server_root_url,
         })
     }
@@ -612,11 +522,7 @@ async fn worker_capabilities(State(state): State<ServerState>) -> Json<Value> {
         "deviceId": state.account.device_id,
         "displayName": state.account.display_name,
         "capabilities": ["agent", "terminal", "workspace"],
-        "auth": if state.worker_config.pairing_token.as_deref().is_some_and(|token| !token.trim().is_empty()) {
-            "pairing-token-v1"
-        } else {
-            "none"
-        },
+        "auth": bonjour::worker_auth(&state.worker_config),
     }))
 }
 
@@ -1926,52 +1832,6 @@ fn apply_configured_headers(
     Ok(request)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct LocalAssistantTurn {
-    content: String,
-    reasoning: String,
-    tool_calls: Vec<LocalToolCall>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LocalToolCall {
-    id: String,
-    name: String,
-    arguments: Value,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LocalToolResult {
-    tool_call_id: String,
-    name: String,
-    content: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LocalToolEvent {
-    tool_call: LocalToolCall,
-    result: LocalToolResult,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LocalAgentRun {
-    output: String,
-    reasoning: String,
-    tool_calls: Vec<LocalToolCall>,
-    tool_events: Vec<LocalToolEvent>,
-}
-
-impl LocalAgentRun {
-    fn from_output(output: String) -> Self {
-        Self {
-            output,
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-            tool_events: Vec::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
     match tool_call.name.as_str() {
@@ -2231,14 +2091,6 @@ fn optional_usize_arg(arguments: &Value, name: &str) -> Result<Option<usize>> {
             .with_context(|| format!("{name} must be a positive integer")),
         Some(_) => anyhow::bail!("{name} must be a positive integer"),
     }
-}
-
-#[cfg(test)]
-struct LocalCommandOutput {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
 }
 
 #[cfg(test)]
@@ -4068,67 +3920,8 @@ fn llm_info(model: &ResolvedLocalLlm) -> Value {
     })
 }
 
-fn account_path() -> PathBuf {
-    warp_core::paths::config_local_dir().join(LOCAL_ACCOUNT_FILE)
-}
-
-fn agent_worker_config_path() -> PathBuf {
-    warp_core::paths::config_local_dir().join(LOCAL_AGENT_WORKER_FILE)
-}
-
 fn llm_config_path() -> PathBuf {
     warp_core::paths::config_local_dir().join(LOCAL_LLM_FILE)
-}
-
-fn local_user_id() -> String {
-    format!("local-user-{}", sanitize_identifier(&local_username()))
-}
-
-fn local_device_id() -> String {
-    format!("local-device-{}", sanitize_identifier(&local_hostname()))
-}
-
-fn local_display_name() -> String {
-    format!("{}@{}", local_username(), local_hostname())
-}
-
-fn local_username() -> String {
-    ["USER", "LOGNAME", "USERNAME"]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn local_hostname() -> String {
-    gethostname::gethostname()
-        .into_string()
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn sanitize_identifier(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
 }
 
 #[cfg(test)]
