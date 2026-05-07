@@ -185,7 +185,7 @@ impl LocalLlmConfig {
                 .as_deref()
                 .map(str::trim)
                 .filter(|thinking| !thinking.is_empty())
-                .unwrap_or("off")
+                .unwrap_or("auto")
                 .to_owned(),
             thinking_budget: model.thinking_budget,
             description: model
@@ -1715,14 +1715,16 @@ fn openai_chat_completion_payload(model: &ResolvedLocalLlm, messages: Vec<Value>
         "stream": false,
     });
 
-    if thinking_enabled(&model.thinking) {
-        if model.api_style.trim().eq_ignore_ascii_case("reasoning") {
+    if model.api_style.trim().eq_ignore_ascii_case("reasoning") {
+        if thinking_explicitly_configured(&model.thinking) {
             payload["reasoning_effort"] = json!(reasoning_effort(&model.thinking));
-        } else {
-            payload["enable_thinking"] = json!(true);
-            if let Some(budget) = model.thinking_budget {
-                payload["thinking_budget"] = json!(budget);
-            }
+        }
+    } else if thinking_explicitly_configured(&model.thinking)
+        || dashscope_needs_enable_thinking(model)
+    {
+        payload["enable_thinking"] = json!(true);
+        if let Some(budget) = model.thinking_budget {
+            payload["thinking_budget"] = json!(budget);
         }
     }
 
@@ -1731,6 +1733,42 @@ fn openai_chat_completion_payload(model: &ResolvedLocalLlm, messages: Vec<Value>
 
 fn thinking_enabled(thinking: &str) -> bool {
     !thinking.trim().is_empty() && !thinking.trim().eq_ignore_ascii_case("off")
+}
+
+fn thinking_explicitly_configured(thinking: &str) -> bool {
+    !thinking.trim().is_empty()
+        && !thinking.trim().eq_ignore_ascii_case("auto")
+        && !thinking.trim().eq_ignore_ascii_case("off")
+}
+
+fn dashscope_needs_enable_thinking(model: &ResolvedLocalLlm) -> bool {
+    if !matches!(
+        model.api_style.trim().to_ascii_lowercase().as_str(),
+        "openai" | "openai-compatible" | "openai_compatible" | "openrouter" | "aliyun"
+    ) {
+        return false;
+    }
+    if model.thinking.trim().eq_ignore_ascii_case("off") {
+        return false;
+    }
+    let url = model.base_url.to_ascii_lowercase();
+    if !(url.contains("dashscope.aliyuncs.com")
+        || url.contains("dashscope-intl.aliyuncs.com")
+        || url.contains("dashscope.cn"))
+    {
+        return false;
+    }
+    let id = model.base_model_name.to_ascii_lowercase();
+    if id.contains("kimi-k2-thinking") {
+        return false;
+    }
+
+    id.contains("qwen3")
+        || id.contains("qwq")
+        || id.contains("deepseek-r1")
+        || id.contains("kimi-k2.5")
+        || id.contains("kimi-k2-")
+        || id.contains("qwen-plus")
 }
 
 #[allow(dead_code)]

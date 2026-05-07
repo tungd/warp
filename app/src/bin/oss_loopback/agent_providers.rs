@@ -113,6 +113,12 @@ async fn complete_assistant_turn(
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
 ) -> Result<LocalAssistantTurn> {
+    if super::dashscope_needs_enable_thinking(model) {
+        let client = reqwest::Client::new();
+        let response = super::call_openai_chat_completion(&client, model, messages).await?;
+        return super::parse_openai_assistant_turn(&response, &model.reasoning_field_name);
+    }
+
     let client = Client::default();
     let target = service_target(model);
     let request = chat_request_from_openai_messages(model, messages)?;
@@ -178,6 +184,7 @@ fn service_target(model: &ResolvedLocalLlm) -> ServiceTarget {
 fn adapter_kind(model: &ResolvedLocalLlm) -> AdapterKind {
     match model.api_style.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => AdapterKind::Anthropic,
+        "aliyun" | "dashscope" => AdapterKind::Aliyun,
         "google" | "gemini" => AdapterKind::Gemini,
         "groq" => AdapterKind::Groq,
         "ollama" => AdapterKind::Ollama,
@@ -229,7 +236,7 @@ fn chat_options(model: &ResolvedLocalLlm) -> ChatOptions {
 }
 
 fn reasoning_effort_for_model(model: &ResolvedLocalLlm) -> Option<ReasoningEffort> {
-    if !super::thinking_enabled(&model.thinking) {
+    if !super::thinking_explicitly_configured(&model.thinking) {
         return None;
     }
     if let Some(budget) = model.thinking_budget {
