@@ -633,6 +633,32 @@ fn local_openai_tools() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "search_replace",
+                "description": "Make a targeted edit in an existing UTF-8 file by replacing an exact text block. The search text must match exactly once.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path to edit"
+                        },
+                        "search": {
+                            "type": "string",
+                            "description": "Exact text to replace. It must appear exactly once in the file."
+                        },
+                        "replace": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        }
+                    },
+                    "required": ["path", "search", "replace"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "grep",
                 "description": "Search workspace files for a Rust-regex pattern. The path must be relative to the workspace.",
                 "parameters": {
@@ -751,6 +777,7 @@ fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<Loc
     match tool_call.name.as_str() {
         "read_file" => execute_read_file_tool(tool_call, workspace),
         "write_file" => execute_write_file_tool(tool_call, workspace),
+        "search_replace" => execute_search_replace_tool(tool_call, workspace),
         "grep" => execute_grep_tool(tool_call, workspace),
         "bash" => execute_bash_tool(tool_call, workspace),
         name => anyhow::bail!("unsupported local tool: {name}"),
@@ -851,6 +878,51 @@ fn execute_write_file_tool(tool_call: &LocalToolCall, workspace: &Path) -> Resul
         tool_call_id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         content: format!("{action} {content_bytes} bytes to {path}."),
+    })
+}
+
+fn execute_search_replace_tool(
+    tool_call: &LocalToolCall,
+    workspace: &Path,
+) -> Result<LocalToolResult> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("search_replace requires a non-empty path")?;
+    let search = tool_call
+        .arguments
+        .get("search")
+        .and_then(Value::as_str)
+        .filter(|search| !search.is_empty())
+        .context("search_replace requires non-empty search text")?;
+    let replace = tool_call
+        .arguments
+        .get("replace")
+        .and_then(Value::as_str)
+        .context("search_replace requires replacement text")?;
+
+    let resolved = resolve_workspace_path(workspace, path)?;
+    let content = fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
+    let match_count = content.match_indices(search).take(2).count();
+    if match_count != 1 {
+        anyhow::bail!("search_replace requires exactly one match, found {match_count}");
+    }
+
+    let updated = content.replacen(search, replace, 1);
+    if updated.len() > LOCAL_TOOL_MAX_WRITE_BYTES {
+        anyhow::bail!("search_replace result exceeds {LOCAL_TOOL_MAX_WRITE_BYTES} bytes");
+    }
+    fs::write(&resolved, updated)
+        .with_context(|| format!("failed to write {}", resolved.display()))?;
+
+    Ok(LocalToolResult {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content: format!("Replaced 1 occurrence in {path}."),
     })
 }
 
@@ -1223,9 +1295,9 @@ where
 fn local_agent_system_prompt() -> &'static str {
     "You are a local coding agent running inside a Warp OSS loopback sidecar. \
 Use tools to inspect and modify the user's current workspace. \
-Available tools: read_file for reading workspace files, grep for searching, write_file for creating or overwriting files, and bash for non-interactive workspace commands. \
+Available tools: read_file for reading workspace files, grep for searching, search_replace for targeted exact-match edits, write_file for creating or overwriting files, and bash for non-interactive workspace commands. \
 Before editing an existing file, inspect it with read_file or grep. \
-Prefer read_file, grep, and write_file over bash for file operations. \
+Prefer read_file, grep, search_replace, and write_file over bash for file operations. \
 After making code changes, run a relevant verification command with bash when one is reasonably available. \
 Keep final answers concise and report what changed plus any verification result."
 }
@@ -1867,6 +1939,54 @@ mod tests {
     }
 
     #[test]
+    fn executes_search_replace_tool_relative_to_workspace() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "alpha\nbeta\n").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_replace".to_string(),
+            name: "search_replace".to_string(),
+            arguments: json!({
+                "path": "notes.md",
+                "search": "beta",
+                "replace": "gamma"
+            }),
+        };
+
+        let result = execute_local_tool(&tool_call, tempdir.path()).unwrap();
+
+        assert_eq!(result.tool_call_id, "call_replace");
+        assert_eq!(result.name, "search_replace");
+        assert_eq!(
+            fs::read_to_string(tempdir.path().join("notes.md")).unwrap(),
+            "alpha\ngamma\n"
+        );
+        assert!(result.content.contains("Replaced 1 occurrence"));
+    }
+
+    #[test]
+    fn search_replace_requires_unique_match() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "same\nsame\n").unwrap();
+        let tool_call = LocalToolCall {
+            id: "call_replace".to_string(),
+            name: "search_replace".to_string(),
+            arguments: json!({
+                "path": "notes.md",
+                "search": "same",
+                "replace": "changed"
+            }),
+        };
+
+        let err = execute_local_tool(&tool_call, tempdir.path()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("exactly one match"));
+        assert_eq!(
+            fs::read_to_string(tempdir.path().join("notes.md")).unwrap(),
+            "same\nsame\n"
+        );
+    }
+
+    #[test]
     fn executes_grep_tool_relative_to_workspace() {
         let tempdir = tempfile::tempdir().unwrap();
         fs::create_dir_all(tempdir.path().join("src")).unwrap();
@@ -1995,6 +2115,12 @@ mod tests {
             tool["type"] == "function"
                 && tool["function"]["name"] == "write_file"
                 && tool["function"]["parameters"]["properties"]["content"]["type"] == "string"
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "function"
+                && tool["function"]["name"] == "search_replace"
+                && tool["function"]["parameters"]["properties"]["search"]["type"] == "string"
+                && tool["function"]["parameters"]["properties"]["replace"]["type"] == "string"
         }));
         assert!(tools.iter().any(|tool| {
             tool["type"] == "function"
