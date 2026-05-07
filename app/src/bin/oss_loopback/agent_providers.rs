@@ -113,12 +113,6 @@ async fn complete_assistant_turn(
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
 ) -> Result<LocalAssistantTurn> {
-    if super::dashscope_needs_enable_thinking(model) {
-        let client = reqwest::Client::new();
-        let response = super::call_openai_chat_completion(&client, model, messages).await?;
-        return super::parse_openai_assistant_turn(&response, &model.reasoning_field_name);
-    }
-
     let client = Client::default();
     let target = service_target(model);
     let request = chat_request_from_openai_messages(model, messages)?;
