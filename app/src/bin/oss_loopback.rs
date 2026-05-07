@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -23,7 +23,7 @@ use prost::Message as _;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::mpsc};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use warp_multi_agent_api as maa;
@@ -298,14 +298,7 @@ impl ResolvedLocalLlm {
         } else {
             "no token configured"
         };
-        if self.base_url.is_empty() {
-            format!("Local {} model ({auth})", self.api_style)
-        } else {
-            format!(
-                "Local {} model at {} ({auth})",
-                self.api_style, self.base_url
-            )
-        }
+        format!("Local {} model ({auth})", self.api_style)
     }
 }
 
@@ -445,12 +438,7 @@ async fn multi_agent(State(state): State<ServerState>, body: Bytes) -> Response 
         }
     };
 
-    let output = match generate_local_agent_output(&state, &request).await {
-        Ok(output) => output,
-        Err(err) => local_agent_error_run(err),
-    };
-
-    response_event_stream(agent_response_events(&request, output))
+    multi_agent_response_event_stream(state, request)
 }
 
 async fn passive_suggestions(_: State<ServerState>, body: Bytes) -> Response {
@@ -471,10 +459,16 @@ async fn passive_suggestions(_: State<ServerState>, body: Bytes) -> Response {
     response_event_stream(finished_response_events(&request))
 }
 
-async fn generate_local_agent_output(
+async fn generate_local_agent_output_with_progress<OnToolCall, OnToolResult>(
     state: &ServerState,
     request: &maa::Request,
-) -> Result<LocalAgentRun> {
+    mut on_tool_call: OnToolCall,
+    mut on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
+{
     let model = LocalLlmConfig::load()?.active_model()?;
 
     match model.api_style.trim().to_ascii_lowercase().as_str() {
@@ -490,12 +484,28 @@ async fn generate_local_agent_output(
         | "gemini" | "openrouter" => {
             let workspace = workspace_for_request(request);
             let messages = openai_messages_for_request(request);
-            call_openai_compatible(&state.client, &model, messages, &workspace).await
+            call_openai_compatible_with_progress(
+                &state.client,
+                &model,
+                messages,
+                &workspace,
+                &mut on_tool_call,
+                &mut on_tool_result,
+            )
+            .await
         }
         _ => {
             let workspace = workspace_for_request(request);
             let messages = openai_messages_for_request(request);
-            call_openai_compatible(&state.client, &model, messages, &workspace).await
+            call_openai_compatible_with_progress(
+                &state.client,
+                &model,
+                messages,
+                &workspace,
+                &mut on_tool_call,
+                &mut on_tool_result,
+            )
+            .await
         }
     }
 }
@@ -546,15 +556,35 @@ fn default_workspace() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+#[cfg(test)]
 async fn call_openai_compatible(
     client: &reqwest::Client,
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
     workspace: &Path,
 ) -> Result<LocalAgentRun> {
-    run_openai_agent_loop(messages, workspace, |messages| {
-        call_openai_chat_completion(client, model, messages)
-    })
+    call_openai_compatible_with_progress(client, model, messages, workspace, |_| {}, |_| {}).await
+}
+
+async fn call_openai_compatible_with_progress<OnToolCall, OnToolResult>(
+    client: &reqwest::Client,
+    model: &ResolvedLocalLlm,
+    messages: Vec<Value>,
+    workspace: &Path,
+    on_tool_call: OnToolCall,
+    on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
+{
+    run_openai_agent_loop_with_progress(
+        messages,
+        workspace,
+        |messages| call_openai_chat_completion(client, model, messages),
+        on_tool_call,
+        on_tool_result,
+    )
     .await
 }
 
@@ -1493,14 +1523,31 @@ fn api_tool_result_text(result: &maa::message::ToolCallResult) -> String {
     }
 }
 
+#[cfg(test)]
 async fn run_openai_agent_loop<F, Fut>(
-    mut messages: Vec<Value>,
+    messages: Vec<Value>,
     workspace: &Path,
-    mut complete: F,
+    complete: F,
 ) -> Result<LocalAgentRun>
 where
     F: FnMut(Vec<Value>) -> Fut,
     Fut: Future<Output = Result<Value>>,
+{
+    run_openai_agent_loop_with_progress(messages, workspace, complete, |_| {}, |_| {}).await
+}
+
+async fn run_openai_agent_loop_with_progress<F, Fut, OnToolCall, OnToolResult>(
+    mut messages: Vec<Value>,
+    workspace: &Path,
+    mut complete: F,
+    mut on_tool_call: OnToolCall,
+    mut on_tool_result: OnToolResult,
+) -> Result<LocalAgentRun>
+where
+    F: FnMut(Vec<Value>) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+    OnToolCall: FnMut(&LocalToolCall) + Send,
+    OnToolResult: FnMut(&LocalToolEvent) + Send,
 {
     let mut tool_events = Vec::new();
     for _ in 0..LOCAL_AGENT_MAX_TURNS {
@@ -1515,6 +1562,7 @@ where
 
         messages.push(openai_assistant_message(&turn));
         for tool_call in &turn.tool_calls {
+            on_tool_call(tool_call);
             let result =
                 execute_local_tool(tool_call, workspace).unwrap_or_else(|err| LocalToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -1522,10 +1570,12 @@ where
                     content: format!("Tool failed: {err:#}"),
                 });
             messages.push(openai_tool_result_message(&result));
-            tool_events.push(LocalToolEvent {
+            let event = LocalToolEvent {
                 tool_call: tool_call.clone(),
                 result,
-            });
+            };
+            on_tool_result(&event);
+            tool_events.push(event);
         }
     }
 
@@ -1919,6 +1969,80 @@ fn shell_exit_code_from_content(content: &str) -> i32 {
         .unwrap_or_else(|| if local_result_is_error(content) { 1 } else { 0 })
 }
 
+fn multi_agent_response_event_stream(state: ServerState, request: maa::Request) -> Response {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let stream_ids = stream_ids(&request);
+        let task_info = task_info(&request);
+        send_response_event(&tx, init_event(&stream_ids));
+        if task_info.needs_create {
+            send_response_event(
+                &tx,
+                client_actions_event(vec![create_task_action(&task_info)]),
+            );
+        }
+
+        let tool_call_tx = tx.clone();
+        let tool_call_task_id = task_info.id.clone();
+        let tool_call_request_id = stream_ids.request_id.clone();
+        let tool_result_tx = tx.clone();
+        let tool_result_task_id = task_info.id.clone();
+        let tool_result_request_id = stream_ids.request_id.clone();
+
+        let run = match generate_local_agent_output_with_progress(
+            &state,
+            &request,
+            move |tool_call| {
+                send_response_event(
+                    &tool_call_tx,
+                    add_messages_event(
+                        &tool_call_task_id,
+                        vec![local_tool_call_message(
+                            tool_call,
+                            &tool_call_task_id,
+                            &tool_call_request_id,
+                        )],
+                    ),
+                );
+            },
+            move |event| {
+                send_response_event(
+                    &tool_result_tx,
+                    add_messages_event(
+                        &tool_result_task_id,
+                        vec![local_tool_result_message(
+                            event,
+                            &tool_result_task_id,
+                            &tool_result_request_id,
+                        )],
+                    ),
+                );
+            },
+        )
+        .await
+        {
+            Ok(run) => run,
+            Err(err) => local_agent_error_run(err),
+        };
+
+        send_response_event(
+            &tx,
+            add_messages_event(
+                &task_info.id,
+                vec![agent_output_message(
+                    &run.output,
+                    &task_info.id,
+                    &stream_ids.request_id,
+                )],
+            ),
+        );
+        send_response_event(&tx, finished_event());
+    });
+
+    response_event_receiver_stream(rx)
+}
+
+#[cfg(test)]
 fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa::ResponseEvent> {
     let stream_ids = stream_ids(request);
     let task_info = task_info(request);
@@ -1943,39 +2067,55 @@ fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa:
 
     let mut actions = Vec::new();
     if task_info.needs_create {
-        actions.push(maa::ClientAction {
-            action: Some(maa::client_action::Action::CreateTask(
-                maa::client_action::CreateTask {
-                    task: Some(maa::Task {
-                        id: task_info.id.clone(),
-                        description: task_info.description,
-                        dependencies: None,
-                        messages: Vec::new(),
-                        summary: String::new(),
-                        server_data: String::new(),
-                    }),
-                },
-            )),
-        });
+        actions.push(create_task_action(&task_info));
     }
-    actions.push(maa::ClientAction {
-        action: Some(maa::client_action::Action::AddMessagesToTask(
-            maa::client_action::AddMessagesToTask {
-                task_id: task_info.id,
-                messages,
-            },
-        )),
-    });
+    actions.push(add_messages_action(&task_info.id, messages));
 
     vec![
         init_event(&stream_ids),
-        maa::ResponseEvent {
-            r#type: Some(maa::response_event::Type::ClientActions(
-                maa::response_event::ClientActions { actions },
-            )),
-        },
+        client_actions_event(actions),
         finished_event(),
     ]
+}
+
+fn create_task_action(task_info: &TaskInfo) -> maa::ClientAction {
+    maa::ClientAction {
+        action: Some(maa::client_action::Action::CreateTask(
+            maa::client_action::CreateTask {
+                task: Some(maa::Task {
+                    id: task_info.id.clone(),
+                    description: task_info.description.clone(),
+                    dependencies: None,
+                    messages: Vec::new(),
+                    summary: String::new(),
+                    server_data: String::new(),
+                }),
+            },
+        )),
+    }
+}
+
+fn add_messages_action(task_id: &str, messages: Vec<maa::Message>) -> maa::ClientAction {
+    maa::ClientAction {
+        action: Some(maa::client_action::Action::AddMessagesToTask(
+            maa::client_action::AddMessagesToTask {
+                task_id: task_id.to_string(),
+                messages,
+            },
+        )),
+    }
+}
+
+fn add_messages_event(task_id: &str, messages: Vec<maa::Message>) -> maa::ResponseEvent {
+    client_actions_event(vec![add_messages_action(task_id, messages)])
+}
+
+fn client_actions_event(actions: Vec<maa::ClientAction>) -> maa::ResponseEvent {
+    maa::ResponseEvent {
+        r#type: Some(maa::response_event::Type::ClientActions(
+            maa::response_event::ClientActions { actions },
+        )),
+    }
 }
 
 fn finished_response_events(request: &maa::Request) -> Vec<maa::ResponseEvent> {
@@ -2014,10 +2154,7 @@ fn finished_event() -> maa::ResponseEvent {
 fn response_event_stream(events: Vec<maa::ResponseEvent>) -> Response {
     let mut body = String::new();
     for event in events {
-        let encoded = BASE64_URL_SAFE.encode(event.encode_to_vec());
-        body.push_str("data: \"");
-        body.push_str(&encoded);
-        body.push_str("\"\n\n");
+        body.push_str(&response_event_sse_chunk(event));
     }
 
     (
@@ -2029,6 +2166,33 @@ fn response_event_stream(events: Vec<maa::ResponseEvent>) -> Response {
         body,
     )
         .into_response()
+}
+
+fn response_event_receiver_stream(mut rx: mpsc::UnboundedReceiver<maa::ResponseEvent>) -> Response {
+    let stream = async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(response_event_sse_chunk(event)));
+        }
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+fn response_event_sse_chunk(event: maa::ResponseEvent) -> String {
+    let encoded = BASE64_URL_SAFE.encode(event.encode_to_vec());
+    format!("data: \"{encoded}\"\n\n")
+}
+
+fn send_response_event(tx: &mpsc::UnboundedSender<maa::ResponseEvent>, event: maa::ResponseEvent) {
+    let _ = tx.send(event);
 }
 
 #[derive(Clone)]
@@ -2806,6 +2970,78 @@ provider = "dashscope"
         assert_eq!(output.tool_events.len(), 1);
         assert_eq!(output.tool_events[0].tool_call.name, "read_file");
         assert_eq!(output.tool_events[0].result.content, "local notes");
+    }
+
+    #[tokio::test]
+    async fn agent_loop_reports_tool_call_before_tool_result() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(tempdir.path().join("notes.md"), "local notes").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let output = run_openai_agent_loop_with_progress(
+            openai_messages_from_prompt("What is in notes.md?"),
+            tempdir.path(),
+            {
+                let calls = calls.clone();
+                move |_messages: Vec<Value>| {
+                    let calls = calls.clone();
+                    async move {
+                        match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 => Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "id": "call_read",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"notes.md\"}"
+                                            }
+                                        }]
+                                    }
+                                }]
+                            })),
+                            1 => Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "content": "done"
+                                    }
+                                }]
+                            })),
+                            _ => panic!("agent loop called the model too many times"),
+                        }
+                    }
+                }
+            },
+            {
+                let progress = progress.clone();
+                move |tool_call| {
+                    progress
+                        .lock()
+                        .unwrap()
+                        .push(format!("call:{}", tool_call.name));
+                }
+            },
+            {
+                let progress = progress.clone();
+                move |event| {
+                    progress
+                        .lock()
+                        .unwrap()
+                        .push(format!("result:{}", event.result.name));
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.output, "done");
+        assert_eq!(
+            progress.lock().unwrap().as_slice(),
+            ["call:read_file", "result:read_file"]
+        );
     }
 
     #[test]
