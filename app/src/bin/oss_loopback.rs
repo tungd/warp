@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     future::Future,
     net::SocketAddr,
@@ -435,7 +435,7 @@ async fn multi_agent(State(state): State<ServerState>, body: Bytes) -> Response 
 
     let output = match generate_local_agent_output(&state, &request).await {
         Ok(output) => output,
-        Err(err) => local_agent_error_message(err),
+        Err(err) => local_agent_error_run(err),
     };
 
     response_event_stream(agent_response_events(&request, output))
@@ -462,7 +462,7 @@ async fn passive_suggestions(_: State<ServerState>, body: Bytes) -> Response {
 async fn generate_local_agent_output(
     state: &ServerState,
     request: &maa::Request,
-) -> Result<String> {
+) -> Result<LocalAgentRun> {
     let model = LocalLlmConfig::load()?.active_model()?;
 
     match model.api_style.trim().to_ascii_lowercase().as_str() {
@@ -470,7 +470,9 @@ async fn generate_local_agent_output(
             let prompt = extract_user_prompt(request)
                 .filter(|prompt| !prompt.trim().is_empty())
                 .unwrap_or_else(|| "Continue the current Warp agent conversation.".to_string());
-            call_anthropic_compatible(&state.client, &model, &prompt).await
+            call_anthropic_compatible(&state.client, &model, &prompt)
+                .await
+                .map(LocalAgentRun::from_output)
         }
         "openai" | "openai-compatible" | "openai_compatible" | "xai" | "grok" | "google"
         | "gemini" | "openrouter" => {
@@ -537,7 +539,7 @@ async fn call_openai_compatible(
     model: &ResolvedLocalLlm,
     messages: Vec<Value>,
     workspace: &Path,
-) -> Result<String> {
+) -> Result<LocalAgentRun> {
     run_openai_agent_loop(messages, workspace, |messages| {
         call_openai_chat_completion(client, model, messages)
     })
@@ -774,6 +776,27 @@ struct LocalToolResult {
     tool_call_id: String,
     name: String,
     content: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalToolEvent {
+    tool_call: LocalToolCall,
+    result: LocalToolResult,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalAgentRun {
+    output: String,
+    tool_events: Vec<LocalToolEvent>,
+}
+
+impl LocalAgentRun {
+    fn from_output(output: String) -> Self {
+        Self {
+            output,
+            tool_events: Vec::new(),
+        }
+    }
 }
 
 fn execute_local_tool(tool_call: &LocalToolCall, workspace: &Path) -> Result<LocalToolResult> {
@@ -1302,6 +1325,7 @@ fn openai_messages_for_request(request: &maa::Request) -> Vec<Value> {
     messages
 }
 
+#[cfg(test)]
 fn openai_messages_from_prompt(prompt: &str) -> Vec<Value> {
     vec![openai_system_message(), openai_user_message(prompt)]
 }
@@ -1445,16 +1469,20 @@ async fn run_openai_agent_loop<F, Fut>(
     mut messages: Vec<Value>,
     workspace: &Path,
     mut complete: F,
-) -> Result<String>
+) -> Result<LocalAgentRun>
 where
     F: FnMut(Vec<Value>) -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
+    let mut tool_events = Vec::new();
     for _ in 0..LOCAL_AGENT_MAX_TURNS {
         let response = complete(messages.clone()).await?;
         let turn = parse_openai_assistant_turn(&response)?;
         if turn.tool_calls.is_empty() {
-            return Ok(turn.content);
+            return Ok(LocalAgentRun {
+                output: turn.content,
+                tool_events,
+            });
         }
 
         messages.push(openai_assistant_message(&turn));
@@ -1466,6 +1494,10 @@ where
                     content: format!("Tool failed: {err:#}"),
                 });
             messages.push(openai_tool_result_message(&result));
+            tool_events.push(LocalToolEvent {
+                tool_call: tool_call.clone(),
+                result,
+            });
         }
     }
 
@@ -1510,20 +1542,376 @@ fn openai_tool_result_message(result: &LocalToolResult) -> Value {
     })
 }
 
-fn agent_response_events(request: &maa::Request, output: String) -> Vec<maa::ResponseEvent> {
-    let stream_ids = stream_ids(request);
-    let task_info = task_info(request);
-    let message = maa::Message {
+fn agent_output_message(output: &str, task_id: &str, request_id: &str) -> maa::Message {
+    local_message(
+        task_id,
+        request_id,
+        maa::message::Message::AgentOutput(maa::message::AgentOutput {
+            text: output.to_string(),
+        }),
+    )
+}
+
+fn local_tool_call_message(
+    tool_call: &LocalToolCall,
+    task_id: &str,
+    request_id: &str,
+) -> maa::Message {
+    local_message(
+        task_id,
+        request_id,
+        maa::message::Message::ToolCall(maa::message::ToolCall {
+            tool_call_id: tool_call.id.clone(),
+            tool: Some(api_tool_from_local(tool_call)),
+        }),
+    )
+}
+
+fn local_tool_result_message(
+    event: &LocalToolEvent,
+    task_id: &str,
+    request_id: &str,
+) -> maa::Message {
+    local_message(
+        task_id,
+        request_id,
+        maa::message::Message::ToolCallResult(maa::message::ToolCallResult {
+            tool_call_id: event.result.tool_call_id.clone(),
+            context: None,
+            result: Some(api_tool_result_from_local(event)),
+        }),
+    )
+}
+
+fn local_message(task_id: &str, request_id: &str, message: maa::message::Message) -> maa::Message {
+    maa::Message {
         id: format!("local-message-{}", Uuid::new_v4()),
-        task_id: task_info.id.clone(),
-        request_id: stream_ids.request_id.clone(),
+        task_id: task_id.to_string(),
+        request_id: request_id.to_string(),
         timestamp: Some(now_timestamp()),
         server_message_data: String::new(),
         citations: Vec::new(),
-        message: Some(maa::message::Message::AgentOutput(
-            maa::message::AgentOutput { text: output },
+        message: Some(message),
+    }
+}
+
+fn api_tool_from_local(tool_call: &LocalToolCall) -> maa::message::tool_call::Tool {
+    match tool_call.name.as_str() {
+        "read_file" => maa::message::tool_call::Tool::ReadFiles(
+            maa::message::tool_call::ReadFiles {
+                files: vec![maa::message::tool_call::read_files::File {
+                    name: local_arg_str(&tool_call.arguments, "path")
+                        .unwrap_or_default()
+                        .to_string(),
+                    line_ranges: local_file_line_range(&tool_call.arguments)
+                        .into_iter()
+                        .collect(),
+                }],
+            },
+        ),
+        "write_file" => maa::message::tool_call::Tool::ApplyFileDiffs(
+            maa::message::tool_call::ApplyFileDiffs {
+                summary: format!(
+                    "Write {}",
+                    local_arg_str(&tool_call.arguments, "path").unwrap_or("file")
+                ),
+                diffs: Vec::new(),
+                new_files: vec![maa::message::tool_call::apply_file_diffs::NewFile {
+                    file_path: local_arg_str(&tool_call.arguments, "path")
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: local_arg_str(&tool_call.arguments, "content")
+                        .unwrap_or_default()
+                        .to_string(),
+                }],
+                deleted_files: Vec::new(),
+                v4a_updates: Vec::new(),
+            },
+        ),
+        "search_replace" => maa::message::tool_call::Tool::ApplyFileDiffs(
+            maa::message::tool_call::ApplyFileDiffs {
+                summary: format!(
+                    "Replace text in {}",
+                    local_arg_str(&tool_call.arguments, "path").unwrap_or("file")
+                ),
+                diffs: vec![maa::message::tool_call::apply_file_diffs::FileDiff {
+                    file_path: local_arg_str(&tool_call.arguments, "path")
+                        .unwrap_or_default()
+                        .to_string(),
+                    search: local_arg_str(&tool_call.arguments, "search")
+                        .unwrap_or_default()
+                        .to_string(),
+                    replace: local_arg_str(&tool_call.arguments, "replace")
+                        .unwrap_or_default()
+                        .to_string(),
+                }],
+                new_files: Vec::new(),
+                deleted_files: Vec::new(),
+                v4a_updates: Vec::new(),
+            },
+        ),
+        "grep" => maa::message::tool_call::Tool::Grep(maa::message::tool_call::Grep {
+            queries: vec![local_arg_str(&tool_call.arguments, "pattern")
+                .unwrap_or_default()
+                .to_string()],
+            path: local_arg_str(&tool_call.arguments, "path")
+                .unwrap_or(".")
+                .to_string(),
+        }),
+        "bash" => maa::message::tool_call::Tool::RunShellCommand(
+            maa::message::tool_call::RunShellCommand {
+                command: local_arg_str(&tool_call.arguments, "command")
+                    .unwrap_or_default()
+                    .to_string(),
+                is_read_only: false,
+                uses_pager: false,
+                citations: Vec::new(),
+                is_risky: false,
+                risk_category: 0,
+                wait_until_complete_value: Some(
+                    maa::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(
+                        true,
+                    ),
+                ),
+            },
+        ),
+        _ => maa::message::tool_call::Tool::Server(maa::message::tool_call::Server {
+            payload: json!({
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            })
+            .to_string(),
+        }),
+    }
+}
+
+fn api_tool_result_from_local(event: &LocalToolEvent) -> maa::message::tool_call_result::Result {
+    let result = &event.result;
+    match event.tool_call.name.as_str() {
+        "read_file" => {
+            maa::message::tool_call_result::Result::ReadFiles(api_read_file_result(event))
+        }
+        "write_file" | "search_replace" => maa::message::tool_call_result::Result::ApplyFileDiffs(
+            api_apply_file_diffs_result(event),
+        ),
+        "grep" => maa::message::tool_call_result::Result::Grep(api_grep_result(event)),
+        "bash" => {
+            maa::message::tool_call_result::Result::RunShellCommand(api_run_shell_result(event))
+        }
+        _ => maa::message::tool_call_result::Result::Server(
+            maa::message::tool_call_result::ServerResult {
+                serialized_result: json!({
+                    "name": result.name,
+                    "content": result.content,
+                })
+                .to_string(),
+            },
+        ),
+    }
+}
+
+fn api_read_file_result(event: &LocalToolEvent) -> maa::ReadFilesResult {
+    if local_result_is_error(&event.result.content) {
+        return maa::ReadFilesResult {
+            result: Some(maa::read_files_result::Result::Error(
+                maa::read_files_result::Error {
+                    message: event.result.content.clone(),
+                },
+            )),
+        };
+    }
+
+    maa::ReadFilesResult {
+        result: Some(maa::read_files_result::Result::TextFilesSuccess(
+            maa::read_files_result::TextFilesSuccess {
+                files: vec![maa::FileContent {
+                    file_path: local_arg_str(&event.tool_call.arguments, "path")
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: event.result.content.clone(),
+                    line_range: local_file_line_range(&event.tool_call.arguments),
+                }],
+            },
         )),
+    }
+}
+
+#[allow(deprecated)]
+fn api_apply_file_diffs_result(event: &LocalToolEvent) -> maa::ApplyFileDiffsResult {
+    if local_result_is_error(&event.result.content) {
+        return maa::ApplyFileDiffsResult {
+            result: Some(maa::apply_file_diffs_result::Result::Error(
+                maa::apply_file_diffs_result::Error {
+                    message: event.result.content.clone(),
+                },
+            )),
+        };
+    }
+
+    let file_path = local_arg_str(&event.tool_call.arguments, "path")
+        .unwrap_or_default()
+        .to_string();
+    let content = local_arg_str(&event.tool_call.arguments, "content")
+        .unwrap_or(&event.result.content)
+        .to_string();
+    let updated_files_v2 = if file_path.is_empty() {
+        Vec::new()
+    } else {
+        vec![maa::apply_file_diffs_result::success::UpdatedFileContent {
+            file: Some(maa::FileContent {
+                file_path,
+                content,
+                line_range: None,
+            }),
+            was_edited_by_user: false,
+        }]
     };
+
+    maa::ApplyFileDiffsResult {
+        result: Some(maa::apply_file_diffs_result::Result::Success(
+            maa::apply_file_diffs_result::Success {
+                updated_files: Vec::new(),
+                updated_files_v2,
+                deleted_files: Vec::new(),
+            },
+        )),
+    }
+}
+
+fn api_grep_result(event: &LocalToolEvent) -> maa::GrepResult {
+    if local_result_is_error(&event.result.content) {
+        return maa::GrepResult {
+            result: Some(maa::grep_result::Result::Error(maa::grep_result::Error {
+                message: event.result.content.clone(),
+            })),
+        };
+    }
+
+    maa::GrepResult {
+        result: Some(maa::grep_result::Result::Success(
+            maa::grep_result::Success {
+                matched_files: grep_matches_from_content(&event.result.content),
+            },
+        )),
+    }
+}
+
+#[allow(deprecated)]
+fn api_run_shell_result(event: &LocalToolEvent) -> maa::RunShellCommandResult {
+    let command = local_arg_str(&event.tool_call.arguments, "command")
+        .unwrap_or_default()
+        .to_string();
+    let exit_code = shell_exit_code_from_content(&event.result.content);
+
+    maa::RunShellCommandResult {
+        command,
+        output: event.result.content.clone(),
+        exit_code,
+        result: Some(maa::run_shell_command_result::Result::CommandFinished(
+            maa::ShellCommandFinished {
+                command_id: event.result.tool_call_id.clone(),
+                output: event.result.content.clone(),
+                exit_code,
+            },
+        )),
+    }
+}
+
+fn local_arg_str<'a>(arguments: &'a Value, name: &str) -> Option<&'a str> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn local_file_line_range(arguments: &Value) -> Option<maa::FileContentLineRange> {
+    let limit = arguments.get("limit")?.as_u64()?;
+    if limit == 0 {
+        return None;
+    }
+    let offset = arguments
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    Some(maa::FileContentLineRange {
+        start: (offset + 1).min(u32::MAX as u64) as u32,
+        end: (offset + limit).min(u32::MAX as u64) as u32,
+    })
+}
+
+fn local_result_is_error(content: &str) -> bool {
+    content.starts_with("Tool failed:")
+}
+
+fn grep_matches_from_content(content: &str) -> Vec<maa::grep_result::success::GrepFileMatch> {
+    let mut matches = BTreeMap::<String, Vec<u32>>::new();
+    for line in content.lines() {
+        if line == "No matches." || line == "Search results truncated." {
+            continue;
+        }
+        let Some((path, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((line_number, _line_content)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(line_number) = line_number.parse::<u32>() else {
+            continue;
+        };
+        matches
+            .entry(path.to_string())
+            .or_default()
+            .push(line_number);
+    }
+
+    matches
+        .into_iter()
+        .map(
+            |(file_path, matched_lines)| maa::grep_result::success::GrepFileMatch {
+                file_path,
+                matched_lines: matched_lines
+                    .into_iter()
+                    .map(
+                        |line_number| maa::grep_result::success::grep_file_match::GrepLineMatch {
+                            line_number,
+                        },
+                    )
+                    .collect(),
+            },
+        )
+        .collect()
+}
+
+fn shell_exit_code_from_content(content: &str) -> i32 {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("Exit code: "))
+        .and_then(|exit_code| exit_code.trim().parse().ok())
+        .unwrap_or_else(|| if local_result_is_error(content) { 1 } else { 0 })
+}
+
+fn agent_response_events(request: &maa::Request, run: LocalAgentRun) -> Vec<maa::ResponseEvent> {
+    let stream_ids = stream_ids(request);
+    let task_info = task_info(request);
+    let mut messages = Vec::new();
+    for event in &run.tool_events {
+        messages.push(local_tool_call_message(
+            &event.tool_call,
+            &task_info.id,
+            &stream_ids.request_id,
+        ));
+        messages.push(local_tool_result_message(
+            event,
+            &task_info.id,
+            &stream_ids.request_id,
+        ));
+    }
+    messages.push(agent_output_message(
+        &run.output,
+        &task_info.id,
+        &stream_ids.request_id,
+    ));
 
     let mut actions = Vec::new();
     if task_info.needs_create {
@@ -1546,7 +1934,7 @@ fn agent_response_events(request: &maa::Request, output: String) -> Vec<maa::Res
         action: Some(maa::client_action::Action::AddMessagesToTask(
             maa::client_action::AddMessagesToTask {
                 task_id: task_info.id,
-                messages: vec![message],
+                messages,
             },
         )),
     });
@@ -1725,6 +2113,10 @@ fn required_str<'a>(value: &'a str, field: &str) -> Result<&'a str> {
 
 fn local_agent_error_message(err: anyhow::Error) -> String {
     format!("Local sidecar LLM request failed:\n\n{err:#}")
+}
+
+fn local_agent_error_run(err: anyhow::Error) -> LocalAgentRun {
+    LocalAgentRun::from_output(local_agent_error_message(err))
 }
 
 fn create_anonymous_user_response(account: &LocalAccount) -> Value {
@@ -2349,7 +2741,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(output, "notes.md says: local notes");
+        assert_eq!(output.output, "notes.md says: local notes");
+        assert_eq!(output.tool_events.len(), 1);
+        assert_eq!(output.tool_events[0].tool_call.name, "read_file");
+        assert_eq!(output.tool_events[0].result.content, "local notes");
     }
 
     #[test]
@@ -2487,7 +2882,7 @@ mod tests {
         .unwrap();
         server.abort();
 
-        assert_eq!(output, "notes.md says: local notes");
+        assert_eq!(output.output, "notes.md says: local notes");
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0]["tools"]
@@ -2504,5 +2899,53 @@ mod tests {
                     && message["tool_call_id"] == "call_read"
                     && message["content"] == "local notes"
             }));
+    }
+
+    #[test]
+    fn agent_response_events_include_tool_messages() {
+        let request = maa::Request::default();
+        let run = LocalAgentRun {
+            output: "done".to_string(),
+            tool_events: vec![LocalToolEvent {
+                tool_call: LocalToolCall {
+                    id: "call_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "notes.md" }),
+                },
+                result: LocalToolResult {
+                    tool_call_id: "call_read".to_string(),
+                    name: "read_file".to_string(),
+                    content: "local notes".to_string(),
+                },
+            }],
+        };
+
+        let events = agent_response_events(&request, run);
+        let messages = events
+            .iter()
+            .filter_map(|event| match event.r#type.as_ref()? {
+                maa::response_event::Type::ClientActions(actions) => Some(actions),
+                _ => None,
+            })
+            .flat_map(|actions| actions.actions.iter())
+            .filter_map(|action| match action.action.as_ref()? {
+                maa::client_action::Action::AddMessagesToTask(add) => Some(add.messages.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            messages[0].message,
+            Some(maa::message::Message::ToolCall(_))
+        ));
+        assert!(matches!(
+            messages[1].message,
+            Some(maa::message::Message::ToolCallResult(_))
+        ));
+        assert!(matches!(
+            messages[2].message,
+            Some(maa::message::Message::AgentOutput(_))
+        ));
     }
 }
