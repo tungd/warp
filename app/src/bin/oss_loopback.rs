@@ -4426,6 +4426,32 @@ thinking_budget = 2048
     }
 
     #[test]
+    fn resolves_agent_prompt_path_relative_to_config_dir() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let home = tempdir.path();
+        let config_dir = home.join(".warp-oss");
+        let prompt = config_dir.join("prompts").join("agent_prompt.txt");
+        fs::create_dir_all(prompt.parent().unwrap()).unwrap();
+        fs::write(&prompt, "dir prompt").unwrap();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+
+        let path = resolve_agent_path("prompts/agent_prompt.txt").unwrap();
+        assert_eq!(path, prompt);
+        assert_eq!(
+            resolve_agent_system_prompt("prompts/agent_prompt.txt").unwrap(),
+            "dir prompt"
+        );
+
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
     fn local_llm_config_resolves_agent_system_prompt_and_enabled_tools() {
         let config: LocalLlmConfig = toml::from_str(
             r#"
