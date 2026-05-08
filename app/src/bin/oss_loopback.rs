@@ -1691,6 +1691,7 @@ where
 async fn generate_worker_agent_output_with_progress<OnToolCall, OnToolResult>(
     state: &ServerState,
     prompt: &str,
+    context_messages: &[Value],
     workspace: &Path,
     mut on_tool_call: OnToolCall,
     mut on_tool_result: OnToolResult,
@@ -1704,7 +1705,7 @@ where
     call_openai_compatible_autonomous_with_progress(
         &state.client,
         &model,
-        openai_messages_from_prompt(prompt, &model),
+        openai_messages_from_worker_context(context_messages, prompt, &model),
         workspace,
         &mut on_tool_call,
         &mut on_tool_result,
@@ -2532,8 +2533,69 @@ fn current_tool_results_for_request(request: &maa::Request) -> Vec<LocalToolResu
         .collect()
 }
 
-fn openai_messages_from_prompt(prompt: &str, model: &ResolvedLocalLlm) -> Vec<Value> {
-    vec![openai_system_message(model), openai_user_message(prompt)]
+fn openai_messages_from_worker_context(
+    context_messages: &[Value],
+    prompt: &str,
+    model: &ResolvedLocalLlm,
+) -> Vec<Value> {
+    let mut messages = vec![openai_system_message(model)];
+    messages.extend(normalize_openai_context_messages(context_messages));
+    messages.push(openai_user_message(prompt));
+    messages
+}
+
+fn openai_worker_context_for_prompt(context_messages: &[Value], prompt: &str) -> Vec<Value> {
+    let mut messages = normalize_openai_context_messages(context_messages);
+    messages.push(openai_user_message(prompt));
+    messages
+}
+
+fn append_openai_worker_context_output(context_messages: &mut Vec<Value>, output: &str) {
+    if !output.trim().is_empty() {
+        context_messages.push(openai_assistant_text_message(output));
+    }
+}
+
+fn normalize_openai_context_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = message.get("role").and_then(Value::as_str)?;
+            if !matches!(role, "user" | "assistant") {
+                return None;
+            }
+            let content = message
+                .get("content")
+                .and_then(openai_context_content_text)
+                .unwrap_or_default();
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(json!({
+                "role": role,
+                "content": content,
+            }))
+        })
+        .collect()
+}
+
+fn openai_context_content_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_owned()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn openai_system_message(model: &ResolvedLocalLlm) -> Value {

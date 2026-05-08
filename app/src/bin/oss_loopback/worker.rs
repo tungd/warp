@@ -39,6 +39,8 @@ pub(crate) struct WorkerRunCreateRequest {
     model_id: Option<String>,
     harness: Option<String>,
     source_device_id: Option<String>,
+    #[serde(default)]
+    context_messages: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -129,6 +131,7 @@ pub(crate) struct WorkerRunRecord {
     updated_at_epoch_millis: u64,
     final_output: Option<String>,
     error: Option<String>,
+    context_messages: Vec<Value>,
     events: Vec<WorkerRunEvent>,
     subscribers: Vec<mpsc::UnboundedSender<WorkerRunEvent>>,
     abort_handle: Option<AbortHandle>,
@@ -137,6 +140,8 @@ pub(crate) struct WorkerRunRecord {
 impl WorkerRunRecord {
     fn new(run_id: String, request: WorkerRunCreateRequest, workspace: PathBuf) -> Self {
         let now = now_epoch_millis();
+        let context_messages =
+            super::openai_worker_context_for_prompt(&request.context_messages, &request.prompt);
         let mut run = Self {
             run_id,
             status: WorkerRunStatus::Pending,
@@ -149,6 +154,7 @@ impl WorkerRunRecord {
             updated_at_epoch_millis: now,
             final_output: None,
             error: None,
+            context_messages,
             events: Vec::new(),
             subscribers: Vec::new(),
             abort_handle: None,
@@ -274,13 +280,7 @@ pub(crate) async fn followup_worker_run(
                 "cannot follow up while the worker run is still active",
             );
         }
-        WorkerRunCreateRequest {
-            prompt: followup.prompt,
-            workspace: Some(run.workspace.display().to_string()),
-            model_id: run.model_id.clone(),
-            harness: run.harness.clone(),
-            source_device_id: run.source_device_id.clone(),
-        }
+        worker_followup_create_request_from_run(run, followup.prompt)
     };
 
     match start_worker_run(state, request).await {
@@ -374,6 +374,7 @@ async fn run_worker_task(
     let result = generate_worker_agent_output_with_progress(
         &state,
         &request.prompt,
+        &request.context_messages,
         &workspace,
         move |tool_call| {
             let _ = tool_call_tx.send(worker_tool_call_event(tool_call));
@@ -473,6 +474,9 @@ async fn finish_run(
         return;
     }
     run.status = status;
+    if let Some(output) = final_output.as_deref() {
+        super::append_openai_worker_context_output(&mut run.context_messages, output);
+    }
     run.final_output = final_output;
     run.error = error;
     run.abort_handle = None;
@@ -512,6 +516,7 @@ fn normalize_create_request(
         .map(str::trim)
         .filter(|source_device_id| !source_device_id.is_empty())
         .map(ToOwned::to_owned);
+    request.context_messages = super::normalize_openai_context_messages(&request.context_messages);
 
     if request
         .harness
@@ -551,6 +556,20 @@ fn workspace_path(
         ));
     }
     Ok(workspace)
+}
+
+fn worker_followup_create_request_from_run(
+    run: &WorkerRunRecord,
+    prompt: String,
+) -> WorkerRunCreateRequest {
+    WorkerRunCreateRequest {
+        prompt,
+        workspace: Some(run.workspace.display().to_string()),
+        model_id: run.model_id.clone(),
+        harness: run.harness.clone(),
+        source_device_id: run.source_device_id.clone(),
+        context_messages: run.context_messages.clone(),
+    }
 }
 
 fn worker_tool_call_event(tool_call: &LocalToolCall) -> WorkerRunEvent {
@@ -636,4 +655,49 @@ fn now_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn create_request(prompt: &str) -> WorkerRunCreateRequest {
+        WorkerRunCreateRequest {
+            prompt: prompt.to_string(),
+            workspace: Some("/tmp".to_string()),
+            model_id: None,
+            harness: Some("local-openai".to_string()),
+            source_device_id: Some("local-device-test".to_string()),
+            context_messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_followup_request_inherits_prior_conversation_context() {
+        let mut record = WorkerRunRecord::new(
+            "run-1".to_string(),
+            create_request("identify the process"),
+            PathBuf::from("/tmp"),
+        );
+        super::super::append_openai_worker_context_output(
+            &mut record.context_messages,
+            "Two mistral-vibe processes found.",
+        );
+
+        let followup = worker_followup_create_request_from_run(&record, "yes please".to_string());
+        let next_context = super::super::openai_worker_context_for_prompt(
+            &followup.context_messages,
+            &followup.prompt,
+        );
+
+        assert_eq!(
+            next_context,
+            vec![
+                json!({ "role": "user", "content": "identify the process" }),
+                json!({ "role": "assistant", "content": "Two mistral-vibe processes found." }),
+                json!({ "role": "user", "content": "yes please" }),
+            ]
+        );
+    }
 }
