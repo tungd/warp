@@ -1465,6 +1465,12 @@ impl AmbientAgentViewModel {
         handoff.submission_state = HandoffSubmissionState::Starting;
         ctx.emit(AmbientAgentViewModelEvent::PendingHandoffChanged);
 
+        let request = self.build_handoff_spawn_request(
+            prompt,
+            attachments,
+            forked_conversation_id,
+            initial_snapshot_token,
+=======
             interactive: None,
             parent_run_id: None,
             runtime_skills: vec![],
@@ -1473,6 +1479,22 @@ impl AmbientAgentViewModel {
             workspace: None,
 >>>>>>> 11d2289f (Pass workspace to WarpSOLO worker spawns)
             initial_snapshot_token,
+            ctx,
+        );
+=======
+            agent_identity_uid: None,
+        };
+>>>>>>> 5acfc88d (Add agent CLI flag for cloud runs (#9935))
+        self.spawn_agent_with_request(request, ctx);
+=======
+        let request = self.build_handoff_spawn_request(
+            prompt,
+            attachments,
+            forked_conversation_id,
+            initial_snapshot_token,
+            ctx,
+        );
+        self.spawn_agent_with_request(request, ctx);
 =======
         let request = self.build_handoff_spawn_request(
             prompt,
@@ -1490,6 +1512,10 @@ impl AmbientAgentViewModel {
             initial_snapshot_token,
             ctx,
         );
+=======
+            agent_identity_uid: None,
+        };
+>>>>>>> 5acfc88d (Add agent CLI flag for cloud runs (#9935))
         self.spawn_agent_with_request(request, ctx);
     }
 
