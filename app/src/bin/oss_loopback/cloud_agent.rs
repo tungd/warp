@@ -64,11 +64,11 @@ impl CloudAgentRunState {
 
     fn as_api_str(self) -> &'static str {
         match self {
-            Self::Pending => "Pending",
-            Self::InProgress => "InProgress",
-            Self::Succeeded => "Succeeded",
-            Self::Failed => "Failed",
-            Self::Cancelled => "Cancelled",
+            Self::Pending => "PENDING",
+            Self::InProgress => "INPROGRESS",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
         }
     }
 
@@ -989,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn api_task_state_uses_warp_variant_names() {
+    fn api_task_state_uses_warp_state_names() {
         let now = now_rfc3339();
         let run = CloudAgentRunRecord {
             run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -1011,7 +1011,7 @@ mod tests {
         };
 
         let value = agent_run_json(&run);
-        assert_eq!(value["state"], "InProgress");
+        assert_eq!(value["state"], "INPROGRESS");
         assert_eq!(value["session_id"], Value::Null);
         assert_eq!(value["status_message"]["message"], "Running");
     }
@@ -1040,14 +1040,14 @@ mod tests {
         };
 
         let value = agent_run_json(&run);
-        assert_eq!(value["state"], "InProgress");
+        assert_eq!(value["state"], "INPROGRESS");
         assert_eq!(value["session_id"], session_id.to_string());
         assert_eq!(value["is_sandbox_running"], true);
         assert_eq!(value["status_message"]["message"], "Worker session ready");
 
         run.session_joined = true;
         let value = agent_run_json(&run);
-        assert_eq!(value["state"], "Succeeded");
+        assert_eq!(value["state"], "SUCCEEDED");
         assert_eq!(value["is_sandbox_running"], false);
     }
 
