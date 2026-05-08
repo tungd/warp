@@ -126,6 +126,7 @@ async fn complete_assistant_turn(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut streamed_tool_calls = Vec::new();
 
     while let Some(event) = stream.next().await {
         match event.context("local LLM stream failed")? {
@@ -134,7 +135,7 @@ async fn complete_assistant_turn(
             ChatStreamEvent::ReasoningChunk(chunk) => reasoning.push_str(&chunk.content),
             ChatStreamEvent::ThoughtSignatureChunk(_) => {}
             ChatStreamEvent::ToolCallChunk(chunk) => {
-                tool_calls.push(local_tool_call_from_genai(chunk.tool_call)?);
+                upsert_streamed_tool_call(&mut streamed_tool_calls, chunk.tool_call);
             }
             ChatStreamEvent::End(end) => {
                 if content.trim().is_empty() {
@@ -147,14 +148,17 @@ async fn complete_assistant_turn(
                         reasoning = captured_reasoning.clone();
                     }
                 }
-                if tool_calls.is_empty() {
-                    if let Some(captured_tool_calls) = end.captured_tool_calls() {
-                        tool_calls = captured_tool_calls
-                            .into_iter()
-                            .cloned()
-                            .map(local_tool_call_from_genai)
-                            .collect::<Result<Vec<_>>>()?;
-                    }
+                if let Some(captured_tool_calls) = end.captured_tool_calls() {
+                    tool_calls = captured_tool_calls
+                        .into_iter()
+                        .cloned()
+                        .map(local_tool_call_from_genai)
+                        .collect::<Result<Vec<_>>>()?;
+                } else {
+                    tool_calls = std::mem::take(&mut streamed_tool_calls)
+                        .into_iter()
+                        .map(local_tool_call_from_genai)
+                        .collect::<Result<Vec<_>>>()?;
                 }
             }
         }
@@ -379,8 +383,33 @@ fn local_tool_call_from_genai(tool_call: ToolCall) -> Result<LocalToolCall> {
     Ok(LocalToolCall {
         id: tool_call.call_id,
         name: tool_call.fn_name,
-        arguments: tool_call.fn_arguments,
+        arguments: normalize_tool_arguments(tool_call.fn_arguments)?,
     })
+}
+
+fn normalize_tool_arguments(arguments: Value) -> Result<Value> {
+    match arguments {
+        Value::String(arguments) => {
+            let arguments = arguments.trim();
+            if arguments.is_empty() {
+                Ok(serde_json::json!({}))
+            } else {
+                serde_json::from_str(arguments).context("tool call arguments were not valid JSON")
+            }
+        }
+        arguments => Ok(arguments),
+    }
+}
+
+fn upsert_streamed_tool_call(tool_calls: &mut Vec<ToolCall>, tool_call: ToolCall) {
+    if let Some(existing) = tool_calls
+        .iter_mut()
+        .find(|existing| existing.call_id == tool_call.call_id)
+    {
+        *existing = tool_call;
+    } else {
+        tool_calls.push(tool_call);
+    }
 }
 
 fn genai_tools(model: &ResolvedLocalLlm) -> Result<Vec<Tool>> {
@@ -426,5 +455,52 @@ fn text_content(value: &Value) -> Option<String> {
             (!text.is_empty()).then_some(text)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(id: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            call_id: id.to_string(),
+            fn_name: "bash".to_string(),
+            fn_arguments: arguments,
+            thought_signatures: None,
+        }
+    }
+
+    #[test]
+    fn parses_genai_string_tool_arguments_as_json() {
+        let tool_call = local_tool_call_from_genai(tool_call(
+            "call_1",
+            Value::String(r#"{"command":"pwd"}"#.to_string()),
+        ))
+        .unwrap();
+
+        assert_eq!(tool_call.arguments, json!({ "command": "pwd" }));
+    }
+
+    #[test]
+    fn upserts_streamed_tool_call_chunks_by_id() {
+        let mut tool_calls = Vec::new();
+
+        upsert_streamed_tool_call(
+            &mut tool_calls,
+            tool_call("call_1", Value::String(String::new())),
+        );
+        upsert_streamed_tool_call(
+            &mut tool_calls,
+            tool_call(
+                "call_1",
+                Value::String(r#"{"command":"printf ok"}"#.to_string()),
+            ),
+        );
+
+        assert_eq!(tool_calls.len(), 1);
+        let tool_call = local_tool_call_from_genai(tool_calls.pop().unwrap()).unwrap();
+        assert_eq!(tool_call.arguments, json!({ "command": "printf ok" }));
     }
 }

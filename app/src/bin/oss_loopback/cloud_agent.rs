@@ -812,7 +812,7 @@ async fn reset_agent_run_for_shared_session_followup(
     prompt: String,
     title: String,
 ) {
-    for event in super::cloud_agent_followup_initial_events(run_id) {
+    for event in super::cloud_agent_followup_initial_events(run_id, &prompt) {
         super::append_agent_shared_session_response_event(state, session_id.clone(), event).await;
     }
 

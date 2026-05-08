@@ -2869,6 +2869,20 @@ fn agent_reasoning_message(reasoning: &str, task_id: &str, request_id: &str) -> 
     )
 }
 
+fn user_query_message(query: &str, task_id: &str, request_id: &str) -> maa::Message {
+    local_message(
+        task_id,
+        request_id,
+        maa::message::Message::UserQuery(maa::message::UserQuery {
+            query: query.to_string(),
+            context: None,
+            referenced_attachments: HashMap::new(),
+            mode: None,
+            intended_agent: Default::default(),
+        }),
+    )
+}
+
 fn local_tool_call_message(
     tool_call: &LocalToolCall,
     task_id: &str,
@@ -3381,14 +3395,31 @@ fn add_messages_event(task_id: &str, messages: Vec<maa::Message>) -> maa::Respon
 fn cloud_agent_initial_events(run_id: &str, title: &str, prompt: &str) -> Vec<maa::ResponseEvent> {
     let stream_ids = cloud_agent_stream_ids(run_id);
     let task_info = cloud_agent_task_info(run_id, title, prompt);
-    vec![
-        init_event(&stream_ids),
-        client_actions_event(vec![create_task_action(&task_info)]),
-    ]
+    let mut actions = vec![create_task_action(&task_info)];
+    if !prompt.trim().is_empty() {
+        actions.push(add_messages_action(
+            &task_info.id,
+            vec![user_query_message(
+                prompt,
+                &task_info.id,
+                &stream_ids.request_id,
+            )],
+        ));
+    }
+
+    vec![init_event(&stream_ids), client_actions_event(actions)]
 }
 
-fn cloud_agent_followup_initial_events(run_id: &str) -> Vec<maa::ResponseEvent> {
-    vec![init_event(&cloud_agent_stream_ids(run_id))]
+fn cloud_agent_followup_initial_events(run_id: &str, prompt: &str) -> Vec<maa::ResponseEvent> {
+    let stream_ids = cloud_agent_stream_ids(run_id);
+    let mut events = vec![init_event(&stream_ids)];
+    if !prompt.trim().is_empty() {
+        events.push(add_messages_event(
+            run_id,
+            vec![user_query_message(prompt, run_id, &stream_ids.request_id)],
+        ));
+    }
+    events
 }
 
 fn cloud_agent_output_event(run_id: &str, output: &str) -> maa::ResponseEvent {
@@ -4231,6 +4262,22 @@ mod tests {
             auth: "none".to_string(),
             last_seen_epoch_millis: 1,
         }
+    }
+
+    fn messages_from_response_events(events: &[maa::ResponseEvent]) -> Vec<&maa::Message> {
+        events
+            .iter()
+            .filter_map(|event| match event.r#type.as_ref()? {
+                maa::response_event::Type::ClientActions(actions) => Some(actions),
+                _ => None,
+            })
+            .flat_map(|actions| actions.actions.iter())
+            .filter_map(|action| match action.action.as_ref()? {
+                maa::client_action::Action::AddMessagesToTask(add) => Some(add.messages.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     #[test]
@@ -5221,6 +5268,28 @@ provider = "dashscope"
             workspace_for_request(&request),
             PathBuf::from("/tmp/warp-workspace")
         );
+    }
+
+    #[test]
+    fn cloud_agent_initial_events_include_user_query_message() {
+        let events = cloud_agent_initial_events("run-1", "WarpSOLO agent", "initial prompt");
+        let messages = messages_from_response_events(&events);
+
+        assert!(messages.iter().any(|message| matches!(
+            message.message.as_ref(),
+            Some(maa::message::Message::UserQuery(query)) if query.query == "initial prompt"
+        )));
+    }
+
+    #[test]
+    fn cloud_agent_followup_initial_events_include_user_query_message() {
+        let events = cloud_agent_followup_initial_events("run-1", "follow-up prompt");
+        let messages = messages_from_response_events(&events);
+
+        assert!(messages.iter().any(|message| matches!(
+            message.message.as_ref(),
+            Some(maa::message::Message::UserQuery(query)) if query.query == "follow-up prompt"
+        )));
     }
 
     #[test]
