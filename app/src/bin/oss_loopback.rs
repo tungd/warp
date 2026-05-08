@@ -31,9 +31,9 @@ use session_sharing_protocol::{
     common::{
         AbsentViewer, ActivePrompt, CommandExecutionFailureReason, CommandExecutionRequestId,
         ControlActionFailureReason, ControlActionRequestId, InputReplicaId, InputUpdate,
-        OrderedTerminalEvent, ParticipantId, ParticipantInfo, ParticipantList,
-        ParticipantPresenceUpdate, PresenceUpdate, PresentViewer, ProfileData, Role,
-        RoleRequestRejectedReason, RoleRequestResponse, Scrollback, Selection, SessionId,
+        OrderedTerminalEvent, OrderedTerminalEventType, ParticipantId, ParticipantInfo,
+        ParticipantList, ParticipantPresenceUpdate, PresenceUpdate, PresentViewer, ProfileData,
+        Role, RoleRequestRejectedReason, RoleRequestResponse, Scrollback, Selection, SessionId,
         SessionSecret, UniversalDeveloperInputContext, Viewer, WindowSize, WriteToPtyFailureReason,
     },
     sharer::{self as sharer_protocol, ReconnectToken},
@@ -412,6 +412,7 @@ struct SharedSession {
     events: BTreeMap<usize, OrderedTerminalEvent>,
     sharer_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     viewers: HashMap<ParticipantId, ViewerState>,
+    agent_run_id: Option<String>,
 }
 
 pub struct LoopbackServer {
@@ -633,6 +634,94 @@ async fn session_page(AxumPath(session_id): AxumPath<String>) -> Response {
     .into_response()
 }
 
+async fn create_agent_shared_session(
+    state: &ServerState,
+    agent_run_id: &str,
+    title: &str,
+    prompt: &str,
+) -> SessionId {
+    let session_id = SessionId::new();
+    let sharer_id = ParticipantId::new();
+    let input_replica_id = InputReplicaId::from(Uuid::new_v4().to_string());
+    let init_block_id = session_sharing_protocol::common::BlockId::from(Uuid::new_v4().to_string());
+    let mut events = BTreeMap::new();
+    events.insert(
+        0,
+        ordered_terminal_text_event(
+            0,
+            &format!(
+                "WarpSOLO remote agent\r\n{}\r\n\r\n> {}\r\n\r\n",
+                title.trim(),
+                prompt.trim()
+            ),
+        ),
+    );
+
+    let session = SharedSession {
+        reconnect_token: ReconnectToken::new(),
+        sharer_id,
+        sharer_firebase_uid: state.account.user_id.clone(),
+        sharer_display_name: state.account.display_name.clone(),
+        sharer_selection: Selection::None,
+        scrollback: Scrollback {
+            blocks: Vec::new(),
+            is_alt_screen_active: false,
+        },
+        active_prompt: ActivePrompt::PS1,
+        window_size: WindowSize {
+            num_rows: 40,
+            num_cols: 120,
+        },
+        init_block_id,
+        input_replica_id,
+        universal_developer_input_context: None,
+        source_type: sharer_protocol::SessionSourceType::AmbientAgent {
+            task_id: Some(agent_run_id.to_string()),
+        },
+        events,
+        sharer_tx: None,
+        viewers: HashMap::new(),
+        agent_run_id: Some(agent_run_id.to_string()),
+    };
+
+    state
+        .shared_sessions
+        .write()
+        .await
+        .insert(session_id.clone(), session);
+    session_id
+}
+
+async fn append_agent_shared_session_text(state: &ServerState, session_id: SessionId, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let mut sessions = state.shared_sessions.write().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return;
+    };
+    let event_no = session
+        .events
+        .keys()
+        .next_back()
+        .map_or(0, |event_no| event_no + 1);
+    let event = ordered_terminal_text_event(event_no, text);
+    session.events.insert(event_no, event.clone());
+    fanout_viewers(
+        session,
+        viewer_protocol::DownstreamMessage::OrderedTerminalEvent(event),
+    );
+}
+
+fn ordered_terminal_text_event(event_no: usize, text: &str) -> OrderedTerminalEvent {
+    let bytes = lz4_flex::block::compress_prepend_size(text.as_bytes());
+    OrderedTerminalEvent {
+        event_no,
+        event_type: OrderedTerminalEventType::PtyBytesRead { bytes },
+    }
+}
+
 async fn create_session_ws(State(state): State<ServerState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_create_session_socket(state, socket))
         .into_response()
@@ -702,6 +791,7 @@ async fn handle_create_session_socket(state: ServerState, socket: WebSocket) {
                 events: BTreeMap::new(),
                 sharer_tx: Some(out_tx.clone()),
                 viewers: HashMap::new(),
+                agent_run_id: None,
             },
         );
     }
@@ -826,6 +916,7 @@ async fn handle_join_session_socket(state: ServerState, session_id: String, sock
     );
     let participant_list = participant_list(session);
     let replay_events = events_after(session, init.last_received_event_no);
+    let agent_run_id = session.agent_run_id.clone();
 
     if rejoining {
         let _ = send_viewer_message(
@@ -855,6 +946,9 @@ async fn handle_join_session_socket(state: ServerState, session_id: String, sock
 
     fanout_participant_list(session, participant_list);
     drop(sessions);
+    if let Some(agent_run_id) = agent_run_id {
+        cloud_agent::mark_session_joined(&state.cloud_agent_runs, &agent_run_id).await;
+    }
 
     for event in replay_events {
         let _ = send_viewer_message(

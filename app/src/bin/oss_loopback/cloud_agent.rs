@@ -10,6 +10,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use session_sharing_protocol::common::SessionId;
 use tokio::sync::RwLock;
 
 use super::{probe_discovery, worker_discovery, ServerState};
@@ -36,6 +37,8 @@ pub(crate) struct CloudAgentRunRecord {
     created_at: String,
     started_at: Option<String>,
     updated_at: String,
+    session_id: Option<SessionId>,
+    session_joined: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,13 +219,7 @@ pub(crate) async fn submit_agent_followup(
 
     match submit_worker_followup(&state, &worker_url, &worker_run_id, &prompt).await {
         Ok(created) => {
-            reset_agent_run_for_followup(
-                &state.cloud_agent_runs,
-                &run_id,
-                created.run_id.clone(),
-                prompt,
-            )
-            .await;
+            reset_agent_run_for_followup(&state, &run_id, created.run_id.clone(), prompt).await;
             spawn_worker_event_pump(
                 state,
                 run_id,
@@ -284,6 +281,15 @@ pub(crate) async fn cancel_agent_run(
     }
 }
 
+pub(crate) async fn mark_session_joined(store: &CloudAgentRunStore, run_id: &str) {
+    let mut runs = store.write().await;
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    run.session_joined = true;
+    run.updated_at = now_rfc3339();
+}
+
 async fn spawn_agent_run(
     state: ServerState,
     mut request: SpawnAgentRequest,
@@ -309,16 +315,20 @@ async fn spawn_agent_run(
     let created = create_worker_run(&state, &worker_url, &request).await?;
     let run_id = created.run_id.clone();
     let now = now_rfc3339();
+    let title = request
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "WarpSOLO agent".to_string());
+    let session_id =
+        super::create_agent_shared_session(&state, &run_id, &title, &request.prompt).await;
     let record = CloudAgentRunRecord {
         run_id: run_id.clone(),
         worker_url: worker_url.clone(),
         worker_run_id: created.run_id.clone(),
         worker_host,
         prompt: request.prompt,
-        title: request
-            .title
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| "WarpSOLO agent".to_string()),
+        title,
         workspace,
         config: request.config,
         state: CloudAgentRunState::Pending,
@@ -327,6 +337,8 @@ async fn spawn_agent_run(
         created_at: now.clone(),
         started_at: None,
         updated_at: now,
+        session_id: Some(session_id),
+        session_joined: false,
     };
     state
         .cloud_agent_runs
@@ -507,8 +519,7 @@ async fn pump_worker_events(
             let frame = buffer[..frame_end].to_string();
             buffer.drain(..frame_end + 2);
             if let Some(event) = parse_worker_sse_frame(&frame)? {
-                let finished =
-                    relay_worker_event_to_record(&state.cloud_agent_runs, run_id, event).await;
+                let finished = relay_worker_event_to_record(&state, run_id, event).await;
                 if finished {
                     return Ok(());
                 }
@@ -519,45 +530,103 @@ async fn pump_worker_events(
 }
 
 async fn relay_worker_event_to_record(
-    store: &CloudAgentRunStore,
+    server_state: &ServerState,
     run_id: &str,
     event: WorkerRunEvent,
 ) -> bool {
     match event {
         WorkerRunEvent::State { state } => {
-            if let Some(state) = CloudAgentRunState::from_worker_state(&state) {
-                update_agent_run_state(store, run_id, state, status_message_for_state(state)).await;
+            if let Some(run_state) = CloudAgentRunState::from_worker_state(&state) {
+                update_agent_run_state(
+                    &server_state.cloud_agent_runs,
+                    run_id,
+                    run_state,
+                    status_message_for_state(run_state),
+                )
+                .await;
+                if run_state == CloudAgentRunState::InProgress {
+                    append_run_session_text(server_state, run_id, "Running on WarpSOLO worker\r\n")
+                        .await;
+                }
             }
         }
         WorkerRunEvent::ToolCall { id, name } => {
-            update_agent_run_status_message(store, run_id, format!("Running tool {name} ({id})"))
-                .await;
+            update_agent_run_status_message(
+                &server_state.cloud_agent_runs,
+                run_id,
+                format!("Running tool {name} ({id})"),
+            )
+            .await;
+            append_run_session_text(
+                server_state,
+                run_id,
+                &format!("Running tool {name} ({id})\r\n"),
+            )
+            .await;
         }
         WorkerRunEvent::ToolResult { id, name, summary } => {
             let summary = truncate_status_message(&summary);
             update_agent_run_status_message(
-                store,
+                &server_state.cloud_agent_runs,
                 run_id,
                 format!("Finished tool {name} ({id}): {summary}"),
+            )
+            .await;
+            append_run_session_text(
+                server_state,
+                run_id,
+                &format!("Finished tool {name} ({id}): {summary}\r\n"),
             )
             .await;
         }
         WorkerRunEvent::ReasoningDelta { text } => {
             if !text.trim().is_empty() {
-                update_agent_run_status_message(store, run_id, truncate_status_message(&text))
-                    .await;
+                update_agent_run_status_message(
+                    &server_state.cloud_agent_runs,
+                    run_id,
+                    truncate_status_message(&text),
+                )
+                .await;
             }
         }
         WorkerRunEvent::OutputDelta { text } => {
-            update_agent_run_output(store, run_id, text).await;
+            update_agent_run_output(&server_state.cloud_agent_runs, run_id, text.clone()).await;
+            append_run_session_text(server_state, run_id, &format!("\r\n{text}\r\n")).await;
         }
         WorkerRunEvent::Error { message } => {
-            update_agent_run_state(store, run_id, CloudAgentRunState::Failed, Some(message)).await;
+            update_agent_run_state(
+                &server_state.cloud_agent_runs,
+                run_id,
+                CloudAgentRunState::Failed,
+                Some(message.clone()),
+            )
+            .await;
+            append_run_session_text(
+                server_state,
+                run_id,
+                &format!("\r\nRemote worker error: {message}\r\n"),
+            )
+            .await;
         }
         WorkerRunEvent::Finished { state } => {
-            let state = CloudAgentRunState::from_worker_state(&state)
+            let run_state = CloudAgentRunState::from_worker_state(&state)
                 .unwrap_or(CloudAgentRunState::Succeeded);
-            update_agent_run_state(store, run_id, state, status_message_for_state(state)).await;
+            update_agent_run_state(
+                &server_state.cloud_agent_runs,
+                run_id,
+                run_state,
+                status_message_for_state(run_state),
+            )
+            .await;
+            append_run_session_text(
+                server_state,
+                run_id,
+                &format!(
+                    "\r\n{}\r\n",
+                    status_message_for_state(run_state).unwrap_or_default()
+                ),
+            )
+            .await;
             return true;
         }
     }
@@ -607,13 +676,31 @@ async fn update_agent_run_output(store: &CloudAgentRunStore, run_id: &str, outpu
     run.updated_at = now_rfc3339();
 }
 
+async fn append_run_session_text(state: &ServerState, run_id: &str, text: &str) {
+    let session_id = {
+        let runs = state.cloud_agent_runs.read().await;
+        runs.get(run_id).and_then(|run| run.session_id.clone())
+    };
+    if let Some(session_id) = session_id {
+        super::append_agent_shared_session_text(state, session_id, text).await;
+    }
+}
+
 async fn reset_agent_run_for_followup(
-    store: &CloudAgentRunStore,
+    state: &ServerState,
     run_id: &str,
     worker_run_id: String,
     prompt: String,
 ) {
-    let mut runs = store.write().await;
+    let title = {
+        let runs = state.cloud_agent_runs.read().await;
+        runs.get(run_id)
+            .map(|run| run.title.clone())
+            .unwrap_or_else(|| "WarpSOLO agent".to_string())
+    };
+    let session_id = super::create_agent_shared_session(state, run_id, &title, &prompt).await;
+
+    let mut runs = state.cloud_agent_runs.write().await;
     let Some(run) = runs.get_mut(run_id) else {
         return;
     };
@@ -624,31 +711,54 @@ async fn reset_agent_run_for_followup(
     run.final_output = None;
     run.started_at = None;
     run.updated_at = now_rfc3339();
+    run.session_id = Some(session_id);
+    run.session_joined = false;
 }
 
 fn agent_run_json(run: &CloudAgentRunRecord) -> Value {
+    let api_state = api_state_for_run(run);
+    let status_message = api_status_message_for_run(run, api_state);
     json!({
         "task_id": run.run_id,
         "parent_run_id": null,
         "title": run.title,
-        "state": run.state.as_api_str(),
+        "state": api_state.as_api_str(),
         "prompt": run.prompt,
         "created_at": run.created_at,
         "started_at": run.started_at,
         "updated_at": run.updated_at,
-        "status_message": run.status_message.as_ref().map(|message| json!({ "message": message })),
+        "status_message": status_message.map(|message| json!({ "message": message })),
         "source": null,
-        "session_id": null,
+        "session_id": run.session_id.as_ref().map(ToString::to_string),
         "session_link": null,
         "creator": null,
         "conversation_id": null,
         "request_usage": null,
-        "is_sandbox_running": false,
+        "is_sandbox_running": run.session_id.is_some() && api_state == CloudAgentRunState::InProgress,
         "agent_config_snapshot": agent_config_snapshot_json(run),
         "artifacts": [],
         "last_event_sequence": 0,
         "children": [],
     })
+}
+
+fn api_state_for_run(run: &CloudAgentRunRecord) -> CloudAgentRunState {
+    if run.session_id.is_some() && !run.session_joined && run.state.is_terminal() {
+        CloudAgentRunState::InProgress
+    } else {
+        run.state
+    }
+}
+
+fn api_status_message_for_run(
+    run: &CloudAgentRunRecord,
+    api_state: CloudAgentRunState,
+) -> Option<&str> {
+    if api_state == CloudAgentRunState::InProgress && run.state.is_terminal() {
+        Some("Worker session ready")
+    } else {
+        run.status_message.as_deref()
+    }
 }
 
 fn agent_config_snapshot_json(run: &CloudAgentRunRecord) -> Value {
@@ -896,12 +1006,49 @@ mod tests {
             created_at: now.clone(),
             started_at: Some(now.clone()),
             updated_at: now,
+            session_id: None,
+            session_joined: false,
         };
 
         let value = agent_run_json(&run);
         assert_eq!(value["state"], "InProgress");
         assert_eq!(value["session_id"], Value::Null);
         assert_eq!(value["status_message"]["message"], "Running");
+    }
+
+    #[test]
+    fn api_state_stays_in_progress_until_synthetic_session_is_joined() {
+        let now = now_rfc3339();
+        let session_id = SessionId::new();
+        let mut run = CloudAgentRunRecord {
+            run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            worker_url: "http://127.0.0.1:9109".to_string(),
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            worker_host: "local-device-worker".to_string(),
+            prompt: "hello".to_string(),
+            title: "WarpSOLO agent".to_string(),
+            workspace: PathBuf::from("/tmp"),
+            config: None,
+            state: CloudAgentRunState::Succeeded,
+            status_message: Some("Worker run completed".to_string()),
+            final_output: Some("done".to_string()),
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            updated_at: now,
+            session_id: Some(session_id.clone()),
+            session_joined: false,
+        };
+
+        let value = agent_run_json(&run);
+        assert_eq!(value["state"], "InProgress");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["is_sandbox_running"], true);
+        assert_eq!(value["status_message"]["message"], "Worker session ready");
+
+        run.session_joined = true;
+        let value = agent_run_json(&run);
+        assert_eq!(value["state"], "Succeeded");
+        assert_eq!(value["is_sandbox_running"], false);
     }
 
     #[test]
