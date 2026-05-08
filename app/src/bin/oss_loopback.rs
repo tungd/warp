@@ -644,18 +644,11 @@ async fn create_agent_shared_session(
     let sharer_id = ParticipantId::new();
     let input_replica_id = InputReplicaId::from(Uuid::new_v4().to_string());
     let init_block_id = session_sharing_protocol::common::BlockId::from(Uuid::new_v4().to_string());
-    let mut events = BTreeMap::new();
-    events.insert(
-        0,
-        ordered_terminal_text_event(
-            0,
-            &format!(
-                "WarpSOLO remote agent\r\n{}\r\n\r\n> {}\r\n\r\n",
-                title.trim(),
-                prompt.trim()
-            ),
-        ),
-    );
+    let events = cloud_agent_initial_events(agent_run_id, title, prompt)
+        .into_iter()
+        .enumerate()
+        .map(|(event_no, event)| (event_no, ordered_agent_response_event(event_no, event)))
+        .collect();
 
     let session = SharedSession {
         reconnect_token: ReconnectToken::new(),
@@ -692,11 +685,11 @@ async fn create_agent_shared_session(
     session_id
 }
 
-async fn append_agent_shared_session_text(state: &ServerState, session_id: SessionId, text: &str) {
-    if text.trim().is_empty() {
-        return;
-    }
-
+async fn append_agent_shared_session_response_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: maa::ResponseEvent,
+) {
     let mut sessions = state.shared_sessions.write().await;
     let Some(session) = sessions.get_mut(&session_id) else {
         return;
@@ -705,8 +698,8 @@ async fn append_agent_shared_session_text(state: &ServerState, session_id: Sessi
         .events
         .keys()
         .next_back()
-        .map_or(0, |event_no| event_no + 1);
-    let event = ordered_terminal_text_event(event_no, text);
+        .map_or(0, |event_no| *event_no + 1);
+    let event = ordered_agent_response_event(event_no, event);
     session.events.insert(event_no, event.clone());
     fanout_viewers(
         session,
@@ -714,11 +707,19 @@ async fn append_agent_shared_session_text(state: &ServerState, session_id: Sessi
     );
 }
 
-fn ordered_terminal_text_event(event_no: usize, text: &str) -> OrderedTerminalEvent {
-    let bytes = lz4_flex::block::compress_prepend_size(text.as_bytes());
+fn ordered_agent_response_event(
+    event_no: usize,
+    event: maa::ResponseEvent,
+) -> OrderedTerminalEvent {
     OrderedTerminalEvent {
         event_no,
-        event_type: OrderedTerminalEventType::PtyBytesRead { bytes },
+        event_type: OrderedTerminalEventType::AgentResponseEvent {
+            response_initiator: None,
+            response_event: warp::terminal::shared_session::ai_agent::encode_agent_response_event(
+                &event,
+            ),
+            forked_from_conversation_token: None,
+        },
     }
 }
 
@@ -1238,12 +1239,46 @@ async fn handle_viewer_messages(
             }
             viewer_protocol::UpstreamMessage::SendAgentPrompt(request) => {
                 let request_id = request.id.clone();
-                let sessions = state.shared_sessions.read().await;
-                let Some(session) = sessions.get(&session_id) else {
-                    break;
+                let (can_execute, sharer_tx, agent_run_id) = {
+                    let sessions = state.shared_sessions.read().await;
+                    let Some(session) = sessions.get(&session_id) else {
+                        break;
+                    };
+                    (
+                        viewer_can_execute(session, &viewer_id),
+                        session.sharer_tx.clone(),
+                        session.agent_run_id.clone(),
+                    )
                 };
-                if viewer_can_execute(session, &viewer_id) {
-                    if let Some(sharer_tx) = &session.sharer_tx {
+                if can_execute {
+                    if let Some(agent_run_id) = agent_run_id {
+                        let result = cloud_agent::submit_shared_session_followup(
+                            state.clone(),
+                            agent_run_id,
+                            session_id.clone(),
+                            request.prompt.clone(),
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => {
+                                let _ = send_viewer_message(
+                                    &out_tx,
+                                    viewer_protocol::DownstreamMessage::AgentPromptRequestInFlight(
+                                        request_id.clone(),
+                                    ),
+                                );
+                            }
+                            Err(err) => {
+                                let _ = send_viewer_message(
+                                    &out_tx,
+                                    viewer_protocol::DownstreamMessage::AgentPromptRequestFailed {
+                                        reason: err.agent_prompt_failure_reason(),
+                                    },
+                                );
+                            }
+                        }
+                        continue;
+                    } else if let Some(sharer_tx) = &sharer_tx {
                         let _ = send_sharer_message(
                             sharer_tx,
                             sharer_protocol::DownstreamMessage::AgentPromptRequested {
@@ -3341,6 +3376,66 @@ fn add_messages_action(task_id: &str, messages: Vec<maa::Message>) -> maa::Clien
 
 fn add_messages_event(task_id: &str, messages: Vec<maa::Message>) -> maa::ResponseEvent {
     client_actions_event(vec![add_messages_action(task_id, messages)])
+}
+
+fn cloud_agent_initial_events(run_id: &str, title: &str, prompt: &str) -> Vec<maa::ResponseEvent> {
+    let stream_ids = cloud_agent_stream_ids(run_id);
+    let task_info = cloud_agent_task_info(run_id, title, prompt);
+    vec![
+        init_event(&stream_ids),
+        client_actions_event(vec![create_task_action(&task_info)]),
+    ]
+}
+
+fn cloud_agent_followup_initial_events(run_id: &str) -> Vec<maa::ResponseEvent> {
+    vec![init_event(&cloud_agent_stream_ids(run_id))]
+}
+
+fn cloud_agent_output_event(run_id: &str, output: &str) -> maa::ResponseEvent {
+    let request_id = cloud_agent_request_id(run_id);
+    add_messages_event(
+        run_id,
+        vec![agent_output_message(output, run_id, &request_id)],
+    )
+}
+
+fn cloud_agent_reasoning_event(run_id: &str, reasoning: &str) -> maa::ResponseEvent {
+    let request_id = cloud_agent_request_id(run_id);
+    add_messages_event(
+        run_id,
+        vec![agent_reasoning_message(reasoning, run_id, &request_id)],
+    )
+}
+
+fn cloud_agent_finished_event() -> maa::ResponseEvent {
+    finished_event()
+}
+
+fn cloud_agent_stream_ids(run_id: &str) -> StreamIds {
+    StreamIds {
+        conversation_id: format!("warpsolo-cloud-conversation-{run_id}"),
+        request_id: cloud_agent_request_id(run_id),
+        run_id: run_id.to_string(),
+    }
+}
+
+fn cloud_agent_request_id(run_id: &str) -> String {
+    format!("warpsolo-cloud-request-{run_id}")
+}
+
+fn cloud_agent_task_info(run_id: &str, title: &str, prompt: &str) -> TaskInfo {
+    TaskInfo {
+        id: run_id.to_string(),
+        description: title
+            .trim()
+            .lines()
+            .next()
+            .filter(|title| !title.is_empty())
+            .or_else(|| prompt.trim().lines().next())
+            .unwrap_or("WarpSOLO agent")
+            .to_string(),
+        needs_create: true,
+    }
 }
 
 fn client_actions_event(actions: Vec<maa::ClientAction>) -> maa::ResponseEvent {
