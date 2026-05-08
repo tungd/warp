@@ -87,20 +87,6 @@ impl AuthState {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_anonymous_for_test() -> Self {
-        use super::user::AnonymousUserType;
-        Self {
-            user: RwLock::new(Some(User {
-                anonymous_user_type: Some(AnonymousUserType::NativeClientAnonymousUserFeatureGated),
-                ..User::test()
-            })),
-            anonymous_id: Uuid::new_v4(),
-            needs_reauth: AtomicBool::new(false),
-            credentials: RwLock::new(Some(Credentials::Test)),
-        }
-    }
-
     /// Creates and initializes auth state. Checks, in order:
     /// 1. Test user (test/integration/skip_login builds)
     /// 2. Provided API key
@@ -658,13 +644,6 @@ impl AuthStateProvider {
     pub fn new_logged_out_for_test() -> Self {
         Self {
             auth_state: Arc::new(AuthState::new_logged_out_for_test()),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new_anonymous_for_test() -> Self {
-        Self {
-            auth_state: Arc::new(AuthState::new_anonymous_for_test()),
         }
     }
 
