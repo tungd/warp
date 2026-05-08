@@ -13157,10 +13157,24 @@ impl Workspace {
     fn show_handoff_success_toast(ctx: &mut ViewContext<Self>) {
         let window_id = ctx.window_id();
         WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                DismissibleToast::default(
+                    "Starting cloud environment for this session...".to_owned(),
+                ),
+=======
+                DismissibleToast::success("Handing off to cloud".to_owned()),
+>>>>>>> 0b8e585a (add & entrypoint for local -> cloud handoff (#10271))
+=======
             toast_stack.add_ephemeral_toast(
                 DismissibleToast::default(
                     "Starting cloud environment for this session...".to_owned(),
                 ),
+=======
+                DismissibleToast::default(
+                    "Starting cloud environment for this session...".to_owned(),
+                ),
+=======
+                DismissibleToast::success("Handing off to cloud".to_owned()),
+>>>>>>> 0b8e585a (add & entrypoint for local -> cloud handoff (#10271))
                 window_id,
                 ctx,
             );
@@ -13298,7 +13312,6 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
-        // Materialize the fork locally so the new pane can restore it.
         let title_override = source_conversation
             .title()
             .map(|t| format!("{t} (Moved to cloud)"));
@@ -13310,6 +13323,22 @@ impl Workspace {
                 title_override.as_deref(),
                 ctx,
             )
+=======
+        let title_override = source_conversation
+            .title()
+            .map(|t| format!("{t} (Moved to cloud)"));
+        let local_fork = match history_model.update(ctx, |history_model, ctx| {
+            history_model.fork_conversation(
+                &source_conversation,
+                FORK_PREFIX,
+                true,
+                title_override.as_deref(),
+                ctx,
+            )
+=======
+        let local_fork = match history_model.update(ctx, |history_model, ctx| {
+            history_model.fork_conversation(&source_conversation, FORK_PREFIX, true, ctx)
+>>>>>>> 0b8e585a (add & entrypoint for local -> cloud handoff (#10271))
         }) {
             Ok(forked) => forked,
             Err(err) => {
