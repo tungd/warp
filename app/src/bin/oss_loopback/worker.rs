@@ -21,8 +21,10 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    generate_worker_agent_output_with_progress, local_agent_error_message,
-    state::LocalAgentWorkerConfig, LocalToolCall, LocalToolEvent, ServerState,
+    append_openai_worker_context_output, append_openai_worker_context_tool_call,
+    append_openai_worker_context_tool_result, generate_worker_agent_output_with_progress,
+    local_agent_error_message, state::LocalAgentWorkerConfig, LocalToolCall, LocalToolEvent,
+    LocalToolResult, ServerState,
 };
 
 pub(crate) type WorkerRunStore = Arc<RwLock<HashMap<String, WorkerRunRecord>>>;
@@ -371,6 +373,10 @@ async fn run_worker_task(
 
     let tool_call_tx = progress_tx.clone();
     let tool_result_tx = progress_tx.clone();
+    let tool_call_store = state.worker_runs.clone();
+    let tool_result_store = state.worker_runs.clone();
+    let tool_call_run_id = run_id.clone();
+    let tool_result_run_id = run_id.clone();
     let result = generate_worker_agent_output_with_progress(
         &state,
         &request.prompt,
@@ -378,9 +384,21 @@ async fn run_worker_task(
         &workspace,
         move |tool_call| {
             let _ = tool_call_tx.send(worker_tool_call_event(tool_call));
+            let store = tool_call_store.clone();
+            let run_id = tool_call_run_id.clone();
+            let tool_call = tool_call.clone();
+            tokio::spawn(async move {
+                append_worker_openai_context_tool_call(&store, &run_id, &tool_call).await;
+            });
         },
         move |event| {
             let _ = tool_result_tx.send(worker_tool_result_event(event));
+            let store = tool_result_store.clone();
+            let run_id = tool_result_run_id.clone();
+            let result = event.result.clone();
+            tokio::spawn(async move {
+                append_worker_openai_context_tool_result(&store, &run_id, &result).await;
+            });
         },
     )
     .await;
@@ -482,6 +500,30 @@ async fn finish_run(
     run.abort_handle = None;
     run.push_event(WorkerRunEvent::State { state: status });
     run.push_event(WorkerRunEvent::Finished { state: status });
+}
+
+async fn append_worker_openai_context_tool_call(
+    store: &WorkerRunStore,
+    run_id: &str,
+    tool_call: &LocalToolCall,
+) {
+    let mut runs = store.write().await;
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    append_openai_worker_context_tool_call(&mut run.context_messages, tool_call);
+}
+
+async fn append_worker_openai_context_tool_result(
+    store: &WorkerRunStore,
+    run_id: &str,
+    result: &LocalToolResult,
+) {
+    let mut runs = store.write().await;
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    append_openai_worker_context_tool_result(&mut run.context_messages, result);
 }
 
 fn normalize_create_request(
@@ -684,6 +726,22 @@ mod tests {
             &mut record.context_messages,
             "Two mistral-vibe processes found.",
         );
+        super::super::append_openai_worker_context_tool_call(
+            &mut record.context_messages,
+            &LocalToolCall {
+                id: "call_bash_echo".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({"command": "printf hi"}),
+            },
+        );
+        super::super::append_openai_worker_context_tool_result(
+            &mut record.context_messages,
+            &LocalToolResult {
+                tool_call_id: "call_bash_echo".to_string(),
+                name: "bash".to_string(),
+                content: "Command: printf hi\nExit code: 0\nhi".to_string(),
+            },
+        );
 
         let followup = worker_followup_create_request_from_run(&record, "yes please".to_string());
         let next_context = super::super::openai_worker_context_for_prompt(
@@ -696,6 +754,11 @@ mod tests {
             vec![
                 json!({ "role": "user", "content": "identify the process" }),
                 json!({ "role": "assistant", "content": "Two mistral-vibe processes found." }),
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{"id": "call_bash_echo", "type": "function", "function": {"name":"bash", "arguments":"{\"command\":\"printf hi\"}"}]
+                }),
+                json!({ "role": "tool", "tool_call_id": "call_bash_echo", "name": "bash", "content": "Command: printf hi\nExit code: 0\nhi" }),
                 json!({ "role": "user", "content": "yes please" }),
             ]
         );

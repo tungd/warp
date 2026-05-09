@@ -1702,7 +1702,7 @@ where
 {
     let model = LocalLlmConfig::load()?.active_model()?;
 
-    call_openai_compatible_autonomous_with_progress(
+    call_openai_compatible_with_progress(
         &state.client,
         &model,
         openai_messages_from_worker_context(context_messages, prompt, &model),
@@ -2556,27 +2556,96 @@ fn append_openai_worker_context_output(context_messages: &mut Vec<Value>, output
     }
 }
 
+pub(crate) fn append_openai_worker_context_tool_call(
+    context_messages: &mut Vec<Value>,
+    tool_call: &LocalToolCall,
+) {
+    context_messages.push(openai_assistant_message(&LocalAssistantTurn {
+        content: String::new(),
+        reasoning: String::new(),
+        tool_calls: vec![tool_call.clone()],
+    }));
+}
+
+pub(crate) fn append_openai_worker_context_tool_result(
+    context_messages: &mut Vec<Value>,
+    result: &LocalToolResult,
+) {
+    context_messages.push(openai_tool_result_message(result));
+}
+
 fn normalize_openai_context_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
         .filter_map(|message| {
             let role = message.get("role").and_then(Value::as_str)?;
-            if !matches!(role, "user" | "assistant") {
-                return None;
+            match role {
+                "user" => normalize_openai_user_context_message(message),
+                "assistant" => normalize_openai_assistant_context_message(message),
+                "tool" => normalize_openai_tool_context_message(message),
+                _ => None,
             }
-            let content = message
-                .get("content")
-                .and_then(openai_context_content_text)
-                .unwrap_or_default();
-            if content.trim().is_empty() {
-                return None;
-            }
-            Some(json!({
-                "role": role,
-                "content": content,
-            }))
         })
         .collect()
+}
+
+fn normalize_openai_user_context_message(message: &Value) -> Option<Value> {
+    let content = message
+        .get("content")
+        .and_then(openai_context_content_text)
+        .filter(|content| !content.trim().is_empty())?;
+
+    Some(json!({
+        "role": "user",
+        "content": content,
+    }))
+}
+
+fn normalize_openai_assistant_context_message(message: &Value) -> Option<Value> {
+    let content = message
+        .get("content")
+        .and_then(openai_context_content_text)
+        .unwrap_or_default();
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .filter(|tool_calls| !tool_calls.is_empty())
+        .cloned();
+
+    if content.trim().is_empty() && tool_calls.is_none() {
+        return None;
+    }
+
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("role".to_string(), Value::String("assistant".to_string()));
+    if !content.trim().is_empty() {
+        normalized.insert("content".to_string(), Value::String(content));
+    }
+    if let Some(tool_calls) = tool_calls {
+        normalized.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    Some(Value::Object(normalized))
+}
+
+fn normalize_openai_tool_context_message(message: &Value) -> Option<Value> {
+    let tool_call_id = message
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tool_call_id| !tool_call_id.is_empty())?;
+    let content = message
+        .get("content")
+        .and_then(openai_context_content_text)
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_default();
+    let name = message.get("name").and_then(Value::as_str).unwrap_or("tool");
+
+    Some(json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": name,
+        "content": content,
+    }))
 }
 
 fn openai_context_content_text(value: &Value) -> Option<String> {
