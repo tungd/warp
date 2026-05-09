@@ -1702,7 +1702,7 @@ where
 {
     let model = LocalLlmConfig::load()?.active_model()?;
 
-    call_openai_compatible_with_progress(
+    call_openai_compatible_autonomous_with_progress(
         &state.client,
         &model,
         openai_messages_from_worker_context(context_messages, prompt, &model),
@@ -2560,10 +2560,9 @@ pub(crate) fn append_openai_worker_context_tool_call(
     context_messages: &mut Vec<Value>,
     tool_call: &LocalToolCall,
 ) {
-    context_messages.push(openai_assistant_message(&LocalAssistantTurn {
-        content: String::new(),
-        reasoning: String::new(),
-        tool_calls: vec![tool_call.clone()],
+    context_messages.push(json!({
+        "role": "assistant",
+        "tool_calls": [openai_tool_call_message(tool_call)],
     }));
 }
 
@@ -2638,7 +2637,10 @@ fn normalize_openai_tool_context_message(message: &Value) -> Option<Value> {
         .and_then(openai_context_content_text)
         .filter(|content| !content.trim().is_empty())
         .unwrap_or_default();
-    let name = message.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let name = message
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
 
     Some(json!({
         "role": "tool",

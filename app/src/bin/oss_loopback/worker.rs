@@ -24,7 +24,7 @@ use super::{
     append_openai_worker_context_output, append_openai_worker_context_tool_call,
     append_openai_worker_context_tool_result, generate_worker_agent_output_with_progress,
     local_agent_error_message, state::LocalAgentWorkerConfig, LocalToolCall, LocalToolEvent,
-    LocalToolResult, ServerState,
+    ServerState,
 };
 
 pub(crate) type WorkerRunStore = Arc<RwLock<HashMap<String, WorkerRunRecord>>>;
@@ -373,10 +373,6 @@ async fn run_worker_task(
 
     let tool_call_tx = progress_tx.clone();
     let tool_result_tx = progress_tx.clone();
-    let tool_call_store = state.worker_runs.clone();
-    let tool_result_store = state.worker_runs.clone();
-    let tool_call_run_id = run_id.clone();
-    let tool_result_run_id = run_id.clone();
     let result = generate_worker_agent_output_with_progress(
         &state,
         &request.prompt,
@@ -384,21 +380,9 @@ async fn run_worker_task(
         &workspace,
         move |tool_call| {
             let _ = tool_call_tx.send(worker_tool_call_event(tool_call));
-            let store = tool_call_store.clone();
-            let run_id = tool_call_run_id.clone();
-            let tool_call = tool_call.clone();
-            tokio::spawn(async move {
-                append_worker_openai_context_tool_call(&store, &run_id, &tool_call).await;
-            });
         },
         move |event| {
             let _ = tool_result_tx.send(worker_tool_result_event(event));
-            let store = tool_result_store.clone();
-            let run_id = tool_result_run_id.clone();
-            let result = event.result.clone();
-            tokio::spawn(async move {
-                append_worker_openai_context_tool_result(&store, &run_id, &result).await;
-            });
         },
     )
     .await;
@@ -407,22 +391,24 @@ async fn run_worker_task(
 
     match result {
         Ok(run) => {
-            if !run.reasoning.trim().is_empty() {
+            let reasoning = run.reasoning;
+            let output = run.output;
+            let tool_events = run.tool_events;
+
+            if !reasoning.trim().is_empty() {
                 append_run_event(
                     &state.worker_runs,
                     &run_id,
-                    WorkerRunEvent::ReasoningDelta {
-                        text: run.reasoning,
-                    },
+                    WorkerRunEvent::ReasoningDelta { text: reasoning },
                 )
                 .await;
             }
-            if !run.output.trim().is_empty() {
+            if !output.trim().is_empty() {
                 append_run_event(
                     &state.worker_runs,
                     &run_id,
                     WorkerRunEvent::OutputDelta {
-                        text: run.output.clone(),
+                        text: output.clone(),
                     },
                 )
                 .await;
@@ -431,8 +417,9 @@ async fn run_worker_task(
                 &state.worker_runs,
                 &run_id,
                 WorkerRunStatus::Succeeded,
-                Some(run.output),
+                Some(output),
                 None,
+                &tool_events,
             )
             .await;
         }
@@ -452,6 +439,7 @@ async fn run_worker_task(
                 WorkerRunStatus::Failed,
                 None,
                 Some(message),
+                &[],
             )
             .await;
         }
@@ -483,6 +471,7 @@ async fn finish_run(
     status: WorkerRunStatus,
     final_output: Option<String>,
     error: Option<String>,
+    tool_events: &[LocalToolEvent],
 ) {
     let mut runs = store.write().await;
     let Some(run) = runs.get_mut(run_id) else {
@@ -492,38 +481,18 @@ async fn finish_run(
         return;
     }
     run.status = status;
+    for event in tool_events {
+        append_openai_worker_context_tool_call(&mut run.context_messages, &event.tool_call);
+        append_openai_worker_context_tool_result(&mut run.context_messages, &event.result);
+    }
     if let Some(output) = final_output.as_deref() {
-        super::append_openai_worker_context_output(&mut run.context_messages, output);
+        append_openai_worker_context_output(&mut run.context_messages, output);
     }
     run.final_output = final_output;
     run.error = error;
     run.abort_handle = None;
     run.push_event(WorkerRunEvent::State { state: status });
     run.push_event(WorkerRunEvent::Finished { state: status });
-}
-
-async fn append_worker_openai_context_tool_call(
-    store: &WorkerRunStore,
-    run_id: &str,
-    tool_call: &LocalToolCall,
-) {
-    let mut runs = store.write().await;
-    let Some(run) = runs.get_mut(run_id) else {
-        return;
-    };
-    append_openai_worker_context_tool_call(&mut run.context_messages, tool_call);
-}
-
-async fn append_worker_openai_context_tool_result(
-    store: &WorkerRunStore,
-    run_id: &str,
-    result: &LocalToolResult,
-) {
-    let mut runs = store.write().await;
-    let Some(run) = runs.get_mut(run_id) else {
-        return;
-    };
-    append_openai_worker_context_tool_result(&mut run.context_messages, result);
 }
 
 fn normalize_create_request(
@@ -701,6 +670,7 @@ fn now_epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LocalToolResult;
     use super::*;
     use serde_json::json;
 
@@ -756,10 +726,59 @@ mod tests {
                 json!({ "role": "assistant", "content": "Two mistral-vibe processes found." }),
                 json!({
                     "role": "assistant",
-                    "tool_calls": [{"id": "call_bash_echo", "type": "function", "function": {"name":"bash", "arguments":"{\"command\":\"printf hi\"}"}]
+                    "tool_calls": [{"id": "call_bash_echo", "type": "function", "function": {"name":"bash", "arguments":"{\"command\":\"printf hi\"}"}}]
                 }),
                 json!({ "role": "tool", "tool_call_id": "call_bash_echo", "name": "bash", "content": "Command: printf hi\nExit code: 0\nhi" }),
                 json!({ "role": "user", "content": "yes please" }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_finish_run_appends_tool_events_before_final_output() {
+        let store = new_worker_run_store();
+        let record = WorkerRunRecord::new(
+            "run-1".to_string(),
+            create_request("inspect the workspace"),
+            PathBuf::from("/tmp"),
+        );
+        store.write().await.insert("run-1".to_string(), record);
+
+        let event = LocalToolEvent {
+            tool_call: LocalToolCall {
+                id: "call_bash_pwd".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({"command": "pwd"}),
+            },
+            result: LocalToolResult {
+                tool_call_id: "call_bash_pwd".to_string(),
+                name: "bash".to_string(),
+                content: "Command: pwd\nExit code: 0\n/tmp".to_string(),
+            },
+        };
+
+        finish_run(
+            &store,
+            "run-1",
+            WorkerRunStatus::Succeeded,
+            Some("The workspace is /tmp.".to_string()),
+            None,
+            &[event],
+        )
+        .await;
+
+        let runs = store.read().await;
+        let run = runs.get("run-1").expect("run exists");
+        assert_eq!(
+            run.context_messages,
+            vec![
+                json!({ "role": "user", "content": "inspect the workspace" }),
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{"id": "call_bash_pwd", "type": "function", "function": {"name":"bash", "arguments":"{\"command\":\"pwd\"}"}}]
+                }),
+                json!({ "role": "tool", "tool_call_id": "call_bash_pwd", "name": "bash", "content": "Command: pwd\nExit code: 0\n/tmp" }),
+                json!({ "role": "assistant", "content": "The workspace is /tmp." }),
             ]
         );
     }
