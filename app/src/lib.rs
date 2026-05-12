@@ -46,6 +46,8 @@ mod interval_timer;
 mod linear;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod login_item;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+mod local_agent;
 mod menu;
 mod modal;
 mod network;

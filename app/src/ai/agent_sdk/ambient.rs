@@ -490,17 +490,9 @@ impl AmbientAgentRunner {
                 interactive: None,
                 parent_run_id: None,
                 runtime_skills: vec![],
-                conversation_id: None,
-                workspace: None,
->>>>>>> 11d2289f (Pass workspace to WarpSOLO worker spawns)
-=======
                 referenced_attachments: vec![],
                 conversation_id: args.conversation,
                 workspace: None,
-=======
-                conversation_id: None,
-                workspace: None,
->>>>>>> 11d2289f (Pass workspace to WarpSOLO worker spawns)
                 initial_snapshot_token: None,
             };
 

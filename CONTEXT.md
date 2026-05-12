@@ -75,3 +75,27 @@ All config lives in `~/.warp-oss/`:
 - `local-account.json` — local identity
 - `settings.toml` — Warp client settings
 - `keybindings.yaml` — custom keybindings
+
+## Isolation Architecture
+
+To minimize merge conflicts during upstream rebases, local agent code is isolated:
+
+```
+app/src/
+├── local_agent/                    # ISOLATED: Local agent adapters
+│   ├── mod.rs
+│   └── handoff/
+│       ├── mod.rs
+│       ├── builder.rs              # LocalSpawnRequestBuilder
+│       └── toast.rs                # show_local_handoff_toast()
+│
+├── bin/oss_loopback.rs             # Binary entry point (5500 lines)
+├── oss_loopback/                   # Loopback server modules
+│
+├── terminal/view/ambient_agent/
+│   └── model.rs                    # Uses LocalSpawnRequestBuilder
+│
+└── workspace/view.rs               # Uses show_local_handoff_toast()
+```
+
+**Pattern**: Upstream files import from `local_agent::handoff` instead of containing local-specific logic directly. This reduces conflict surface area during rebases.

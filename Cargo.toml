@@ -40,6 +40,7 @@ computer_use = { path = "crates/computer_use" }
 field_mask = { path = "crates/field_mask" }
 firebase = { path = "crates/firebase" }
 fuzzy_match = { path = "crates/fuzzy_match" }
+genai = "=0.6.0-beta.18"
 handlebars = { path = "crates/handlebars" }
 http_client = { path = "crates/http_client" }
 http_server = { path = "crates/http_server" }
@@ -145,7 +146,6 @@ futures = { version = "0.3", features = ["executor", "thread-pool"] }
 futures-lite = "1.13.0"
 futures-util = { version = "0.3", default-features = false }
 get-size = { version = "0.1.4", features = ["derive"] }
-genai = "=0.6.0-beta.18"
 globset = "0.4.18"
 gloo = { version = "0.11.0", default-features = false, features = [
   "events",
@@ -182,26 +182,6 @@ line-ending = "1.4.0"
 log = { version = "0.4", features = ["serde", "std"] }
 mermaid_to_svg = { git = "https://github.com/warpdotdev/mermaid-to-svg.git", rev = "81551775746cd86bdeec29cb96ba278fd08c9074" }
 mdns-sd = "0.19.1"
-=======
-mermaid_to_svg = { git = "https://github.com/warpdotdev/mermaid-to-svg.git", rev = "4761588218f747c07d72fd324efcd2032d873aaf" }
-mdns-sd = "0.19.1"
->>>>>>> 1cf5d089 (Add Bonjour discovery for WarpSOLO workers)
-=======
->>>>>>> e7576776 (Replace Bonjour worker discovery with probing)
-=======
-log = { version = "0.4", features = ["serde", "std"] }
-mermaid_to_svg = { git = "https://github.com/warpdotdev/mermaid-to-svg.git", rev = "81551775746cd86bdeec29cb96ba278fd08c9074" }
-mdns-sd = "0.19.1"
-=======
-log = { version = "0.4", features = ["serde", "std"] }
-mermaid_to_svg = { git = "https://github.com/warpdotdev/mermaid-to-svg.git", rev = "81551775746cd86bdeec29cb96ba278fd08c9074" }
-mdns-sd = "0.19.1"
-=======
-mermaid_to_svg = { git = "https://github.com/warpdotdev/mermaid-to-svg.git", rev = "4761588218f747c07d72fd324efcd2032d873aaf" }
-mdns-sd = "0.19.1"
->>>>>>> 1cf5d089 (Add Bonjour discovery for WarpSOLO workers)
-=======
->>>>>>> e7576776 (Replace Bonjour worker discovery with probing)
 mime_guess = "2.0"
 minimp4 = "0.1.2"
 nix = { version = "0.26.4", default-features = false, features = ["signal"] }
